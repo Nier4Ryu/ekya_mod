@@ -40,8 +40,9 @@ class MLModel(object):
         NUM_CLASSES = self.hyperparameters["num_classes"]
         self.inference_scaling_function = inference_scaling_function    # The input range of the inference scaling function should be 0-1. Need to translate percentage by /100.
         self.name = name
+        
         self.model = Resnet(NUM_CLASSES, hyperparameters=self.hyperparameters, restore_path=self.restore_path, device=device)
-
+        
     def retrain_model(self,
                       train_loader: torch.utils.data.DataLoader,
                       val_loader: torch.utils.data.DataLoader,

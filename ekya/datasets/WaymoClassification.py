@@ -13,13 +13,13 @@ from typing import List, Union
 import numpy as np
 import pandas as pd
 import PIL
-import tensorflow as tf
+# import tensorflow as tf # -> Removed as We do not need to use waymoclassification at all!
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision.datasets.vision import VisionDataset
 
-from waymo_open_dataset import dataset_pb2 as open_dataset
+# from waymo_open_dataset import dataset_pb2 as open_dataset # -> We do not need to use waymoopen classification at all!
 
 
 def get_upright_box(waymo_box):
