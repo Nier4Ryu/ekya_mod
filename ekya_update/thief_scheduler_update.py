@@ -1,19 +1,20 @@
-import time, numpy as np, ray, pandas as pd
+import time, numpy as np, ray, pandas as pd, os
 from typing import List
 from ekya.simulation.camera import generate_training_job
 from ekya.simulation.schedulers import thief_sco_scheduler
 from ekya.simulation.jobs import InferenceJob as SimInferenceJob
 from ekya.schedulers.scheduler import BaseScheduler, fair_reallocation
-from ekya.microprofilers.simple_microprofiler import subsample_dataloader
 from ekya.microprofilers.modelling_funcs import get_scaled_optimus_fn, get_linear_fn
 from ekya_update.camera_update import CameraSubstitution
-from ekya_update.simple_microprofiler_update import SimpleMicroprofilerSubstitution
+from ekya_update.simple_microprofiler_update import SimpleMicroprofilerSubstitution, subsample_dataloader
 from ekya_update.common import stop_sys
 
 class ThiefSchedulerSubstitution(BaseScheduler):
     # Updated some part at least
     def __init__(self,
                  scheduler_kwargs,
+                 model_load_path,
+                 log_dir,
                  ):
         self.scheduler_kwargs = scheduler_kwargs
         self.inference_profile = pd.read_csv(self.scheduler_kwargs["inference_profile_path"])
@@ -22,10 +23,14 @@ class ThiefSchedulerSubstitution(BaseScheduler):
         self.microprofile_epochs = self.scheduler_kwargs["microprofile_epochs"]
         self.microprofile_subsample_rate = self.scheduler_kwargs["microprofile_subsample_rate"]
         self.profiling_epochs = np.array(self.scheduler_kwargs["profiling_epochs"])
-        self.default_hyperparams = self.scheduler_kwargs["hyperparams"]
+        self.default_hyperparams = self.scheduler_kwargs["hyperparams"]["0"] # Use hyperparameters 0 as default
+        self.hyperparameters = self.scheduler_kwargs["hyperparams"]
         self.predmodel_acc_args = self.scheduler_kwargs["predmodel_acc_args"]
         self.measured_time_per_epoch_for_hyperparams=self.scheduler_kwargs["measured_time_per_epoch_for_hyperparams"]
         self.measured_inittime_for_hyperparams=self.scheduler_kwargs["measured_inittime_for_hyperparams"]
+        
+        self.model_load_path = model_load_path
+        self.log_dir = log_dir
         
     def generate_profiles(self, cameras, microprofile_results, default_inference_accs):
         profiles = {}
@@ -47,6 +52,7 @@ class ThiefSchedulerSubstitution(BaseScheduler):
                     microprofile_accuracy_model = lambda x: default_acc * np.ones_like(x)
 
                 # Get runtime model
+                print(f"For debug:{self.measured_time_per_epoch_for_hyperparams}")
                 time_per_epoch = self.measured_time_per_epoch_for_hyperparams[hyperparameters['id']]
                 init_time = self.measured_inittime_for_hyperparams[hyperparameters['id']]
                 microprofile_runtime_model = get_linear_fn(a=time_per_epoch,
@@ -71,22 +77,51 @@ class ThiefSchedulerSubstitution(BaseScheduler):
         ray_microprof = ray.remote(SimpleMicroprofilerSubstitution)
         microprofs = {}
         microprof_tasks = {}
-        for camera in cameras:
+        for camera_idx, camera in enumerate(cameras):
             this_microprof = ray_microprof.options(num_cpus=0).remote(self.microprofile_device)
             microprofs[camera.id] = this_microprof
             dataloaders = [camera._get_dataloader(task_id=task_id, train_batch_size=hp["train_batch_size"],
                                                   test_batch_size=hp["test_batch_size"], subsample_rate=hp["subsample"])
                            for hp in hyp_list]
-
-            message = f"What should be the pretrained model path here??"
-            stop_sys(message, raise_error=True)
+            
             pretrained_model_path = None
+            # Use initial model
+            if task_id==0:
+                pretrained_model_path = self.model_load_path
+            # Use updated model
+            else:
+                # Look into the model train history, find the newest model and use that models path!
+                # Case 1: No model was pretrained before -> just use initial model!
+                model_train_history_df_path = os.path.join(self.log_dir, str(camera_idx), "model_train_history.csv")
+                if not os.path.exists(model_train_history_df_path):
+                    pretrained_model_path = self.model_load_path
+                # Case 2: Load the most recent one's vals
+                else:
+                    model_train_history_df = pd.read_csv(model_train_history_df_path)
+                    weight_save_path = model_train_history_df['weight_save_path'].iloc[-1]
+                    prev_task_num = model_train_history_df['task_num'].iloc[-1]
+                    chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
+                    hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
+                    epoch  = model_train_history_df['epoch'].iloc[-1]
+
+                    # Check for conflict issues
+                    if prev_task_num > task_id:
+                        message = "There was an error in model_train_history_logging, fix this issue!"
+                        stop_sys(message, raise_error=True)
+                    else:
+                        pretrained_model_path = weight_save_path
+            
+            
             microprof_task = microprofs[camera.id].run_microprofiling.remote(candidate_hyperparams=hyp_list,
                                                                              dataloaders=dataloaders,
                                                                              resources=self.microprofile_resources_per_trial,
                                                                              epochs=self.microprofile_epochs,
                                                                              pretrained_model_path=pretrained_model_path,
-                                                                             subsample_rate=self.microprofile_subsample_rate)
+                                                                             subsample_rate=self.microprofile_subsample_rate,
+                                                                             task_num=task_id,
+                                                                             camera_idx=camera_idx, 
+                                                                             log_dir=self.log_dir,
+                                                                             )
             microprof_tasks[camera.id] = microprof_task
         micrprofile_results = {}
         for camera in cameras:
@@ -105,52 +140,59 @@ class ThiefSchedulerSubstitution(BaseScheduler):
                      state: dict):
         task_id = state["task_id"]
         retraining_period = state["retraining_period"]
-        
-        microprofile_start_time = time.time()
-        # Run microprofiling for each camera - both training and inference
-        microprofile_results = self.execute_microprofiling(cameras, task_id)
-        # Get default inference accuracy from microprofile results
-        default_inference_accs = {i: [hp_result['preretrain_test_acc'] for hp_result in result] for i, result in
-                                  microprofile_results.items()}  # self.get_default_inference_accs(cameras, task_id, subsample_rate=test_subsample_rate)
-        
-        
-         # Generate more profiles by interpolation from micro profiles
-        profiles = self.generate_profiles(cameras, microprofile_results, default_inference_accs)
 
-        # Generate SimInferenceJobs
-        SimInferenceJobs = {}
-        for camera in cameras:
-            SimInferenceJobs[camera.id] = SimInferenceJob(
-                f"{camera.id}_inference", default_inference_accs[camera.id][0], self.default_hyperparams['model_name'],
-                # TODO(romilb): Get inference accuracy from current inference config rather than 0th hyperparam.
-                self.inference_profile['subsampling'], self.inference_profile['c1'],
-                resource_alloc=0)  # Start with 0 alloc because the scheduler will modify this
+        # No training data available at task 0 - inference only
+        if task_id == 0:
+            inference_resource_weights, hyperparameters = self.get_inference_schedule(cameras, resources)
+            training_resource_weights = {c.id: 0 for c in cameras}
+            schedule_result = inference_resource_weights, training_resource_weights, hyperparameters
+        else:
+            microprofile_start_time = time.time()
+            # Run microprofiling for each camera - both training and inference
+            microprofile_results = self.execute_microprofiling(cameras, task_id)
+            # Get default inference accuracy from microprofile results
+            default_inference_accs = {i: [hp_result['preretrain_test_acc'] for hp_result in result] for i, result in
+                                      microprofile_results.items()}
 
-        # Generate SimTrainingJobs
-        SimTrainingCfgs = {}
-        for camera in cameras:
-            SimTrainingCfgs[camera.id] = [
-                generate_training_job(f"{camera.id}_train_{hp['id']}_{epochs}", acc_prediction, runtime_prediction,
-                                      preretrain_acc, model_name=hp['model_name'], oracle=False)
-                for [hp, acc_prediction, runtime_prediction, epochs, preretrain_acc] in profiles[camera.id] if
-                acc_prediction > preretrain_acc]
+            # Generate more profiles by interpolation from micro profiles
+            profiles = self.generate_profiles(cameras, microprofile_results, default_inference_accs)
 
-        sched_job_pairs = [[SimInferenceJobs[camera.id], SimTrainingCfgs[camera.id]] for camera in cameras]
+            # Generate SimInferenceJobs
+            SimInferenceJobs = {}
+            for camera in cameras:
+                SimInferenceJobs[camera.id] = SimInferenceJob(
+                    f"{camera.id}_inference", default_inference_accs[camera.id][0], self.default_hyperparams['model_name'],
+                    # TODO(romilb): Get inference accuracy from current inference config rather than 0th hyperparam.
+                    self.inference_profile['subsampling'], self.inference_profile['c1'],
+                    resource_alloc=0)  # Start with 0 alloc because the scheduler will modify this
 
-        microprofile_time_taken = time.time() - microprofile_start_time
-        remaining_time = int(retraining_period - microprofile_time_taken)
-        assert remaining_time > 0, "Microprofiling took all the time in the retraining period and no retraining " \
-                                   "happened. Microprofiling time = {}, Retraining period = {}".format(
-            microprofile_time_taken, retraining_period)
+            # Generate SimTrainingJobs
+            SimTrainingCfgs = {}
+            for camera in cameras:
+                SimTrainingCfgs[camera.id] = [
+                    generate_training_job(f"{camera.id}_train_{hp['id']}_{epochs}", acc_prediction, runtime_prediction,
+                                          preretrain_acc, model_name=hp['model_name'], oracle=False)
+                    for [hp, acc_prediction, runtime_prediction, epochs, preretrain_acc] in profiles[camera.id] if
+                    acc_prediction > preretrain_acc]
 
-        schedule = thief_sco_scheduler(sched_job_pairs,
-                                       resources,
-                                       remaining_time,
-                                       iterations=3,
-                                       steal_increment=0.1)
-        init_schedule = schedule[0]
-        print("[THIEF SCHEDULER] Schedule from thief scheduler: {}".format(init_schedule))
-        return self.extract_ekya_schedule(init_schedule, self.hyperparameters)
+            sched_job_pairs = [[SimInferenceJobs[camera.id], SimTrainingCfgs[camera.id]] for camera in cameras]
+
+            microprofile_time_taken = time.time() - microprofile_start_time
+            remaining_time = int(retraining_period - microprofile_time_taken)
+            assert remaining_time > 0, "Microprofiling took all the time in the retraining period and no retraining " \
+                                       "happened. Microprofiling time = {}, Retraining period = {}".format(
+                microprofile_time_taken, retraining_period)
+
+            schedule = thief_sco_scheduler(sched_job_pairs,
+                                           resources,
+                                           remaining_time,
+                                           iterations=3,
+                                           steal_increment=0.1)
+            init_schedule = schedule[0]
+            print("[THIEF SCHEDULER] Schedule from thief scheduler: {}".format(init_schedule))
+            schedule_result = self.extract_ekya_schedule(init_schedule, self.hyperparameters)
+
+        return schedule_result
     
     @staticmethod
     def extract_ekya_schedule(schedule: dict,

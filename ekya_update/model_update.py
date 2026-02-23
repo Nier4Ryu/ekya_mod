@@ -3,14 +3,14 @@ This is a replacement of previous 'baselines/ekya/ekya/models/resnet.py' so as t
 """
 
 
-import re, torch, torch.nn as nn,  ray, os, time, numpy as np, torch.optim as optim, copy
+import re, torch, torch.nn as nn, torch.nn.functional as F, torchvision.models as models, ray, os, time, numpy as np, torch.optim as optim, copy, pandas as pd, timm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from typing import Union, List
 from collections import defaultdict
 from ekya.utils.mps import set_mps_envvars
 from ekya.CONFIG import RANDOM_SEED
 from ekya.utils.helpers import seed_all
-from ekya_update.common import stop_sys
+from ekya_update.common import stop_sys, atomic_to_csv, atomic_torch_save, DINOv3_MODEL_LOCAL_REPO, DINOv3_MODEL_WEIGHT_PATH_BASE
 
 """
 This part is from ekya/classes/models.py
@@ -23,7 +23,10 @@ class MLModelSubstitution(object):
                  inference_scaling_function: callable = lambda x: 1,
                  restore_path: str = "",
                  device: str = 'auto',
-                 name='unnamed'):
+                 name='unnamed',
+                 camera_idx:int=None,
+                 log_dir:str=None,
+                 ):
         self.hyperparameters = hyperparameters
         self.gpu_allocation_percentage = gpu_allocation_percentage
         self.restore_path = restore_path
@@ -32,8 +35,11 @@ class MLModelSubstitution(object):
         NUM_CLASSES = self.hyperparameters["num_classes"]
         self.inference_scaling_function = inference_scaling_function    # The input range of the inference scaling function should be 0-1. Need to translate percentage by /100.
         self.name = name
+        
+        self.camera_idx=camera_idx
+        self.log_dir=log_dir
 
-        self.model = EkyaModelWrapper(NUM_CLASSES, hyperparameters=self.hyperparameters, restore_path=self.restore_path, device=device)
+        self.model = EkyaModelWrapper(NUM_CLASSES, hyperparameters=self.hyperparameters, restore_path=self.restore_path, device=device, camera_idx=self.camera_idx, log_dir=self.log_dir)
 
     def retrain_model(self,
                       train_loader: torch.utils.data.DataLoader,
@@ -41,7 +47,10 @@ class MLModelSubstitution(object):
                       test_loader: torch.utils.data.DataLoader,
                       hyperparameters: dict,
                       validation_freq: int = -1,
-                      profiling_mode = False):
+                      profiling_mode = False,
+                      task_num=None,
+                      save_model=True,
+                      ):
         """
         Retrains a model given new dataloader.
         :param train_loader: Dataloader for the train set
@@ -63,13 +72,9 @@ class MLModelSubstitution(object):
         profile_preretrain_test_acc = None
         profile_test_acc = None
 
-        print("Retraining hyps: {}\nHashes:\nTrain: {}\nVal: {}\nTest: {}".format(hyperparameters,
-                                                                                  train_loader.dataset.get_md5(),
-                                                                                  test_loader.dataset.get_md5(),
-                                                                                  val_loader.dataset.get_md5()))
         #if profiling_mode:
         start_time = time.time()
-        profile_preretrain_test_acc = self.model.infer(dataloaders_dict['test'])
+        profile_preretrain_test_acc, log_items = self.model.infer(dataloaders_dict['test'])
         infer_time_pre = time.time() - start_time
         print("Profile mode: pre-retrain testing took {} seconds and got acc {:.2f}".format(infer_time_pre, profile_preretrain_test_acc))
         #print("Dataloader: {}".format(dataloaders_dict['test'].dataset.samples))
@@ -78,13 +83,13 @@ class MLModelSubstitution(object):
 
         retrain_start_time = time.time()
         _, _, best_val_acc, profile, subprofile_test_results, misc_return = self.model.train_model(dataloaders_dict, num_epochs=NUM_EPOCHS, lr=LR,
-                                                                                      momentum=MOMENTUM, validation_freq=validation_freq)
+                                                                                      momentum=MOMENTUM, validation_freq=validation_freq, task_num=task_num, save_model=save_model)
         retrain_end_time = time.time()
         retrain_time = retrain_end_time - retrain_start_time
 
         #if profiling_mode:
         start_time = time.time()
-        profile_test_acc = self.model.infer(dataloaders_dict['test'])
+        profile_test_acc, log_items = self.model.infer(dataloaders_dict['test'])
         infer_time_post = time.time() - start_time
         print("Profile mode: post-retrain testing took {} seconds and got acc {:.2f}".format(infer_time_post, profile_test_acc))
         #print("Dataloader: {}".format(dataloaders_dict['test'].dataset.samples))
@@ -98,7 +103,7 @@ class MLModelSubstitution(object):
         return best_val_acc, profile, subprofile_test_results, profile_preretrain_test_acc, profile_test_acc, misc_return
 
     def test_acc(self, test_loader: torch.utils.data.DataLoader, resource_scaled=True):
-        test_acc = self.model.infer(test_loader)
+        test_acc, log_items = self.model.infer(test_loader)
         # Implement scaling with GPU allocation here.
         if resource_scaled:
             scaling_factor = self.inference_scaling_function(self.gpu_allocation_percentage/100)
@@ -141,27 +146,49 @@ class EkyaModelWrapper(object):
     DEFAULT_HYPER_PARAMS = {'num_hidden': 512,
                             'last_layer_only': True,
                             'model_name': "resnet18"}
-    def __init__(self, num_classes, pretrained=True, restore_path=None, hyperparameters=None, device='auto'):
+    def __init__(self, num_classes, pretrained=True, restore_path=None, hyperparameters=None, device='auto', camera_idx=None, log_dir=None):
         # hyper parameters matching process (Adapter)
         self.hyperparameters = hyperparameters if hyperparameters else self.DEFAULT_HYPER_PARAMS
         model_name = hyperparameters["model_name"]
-        lasrt_layer_only = hyperparameters["last_layer_only"]
+        last_layer_only = hyperparameters["last_layer_only"]
         hidden_layers = hyperparameters["num_hidden"]
         
         if device == 'auto':
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = torch.device(device)
+            
+        self.camera_idx = camera_idx
+        self.log_dir = log_dir
         
         # Loading model
-        self.model = get_default_model_from_params(model_name=model_name, pretrained=True, hidden_layers=hidden_layers, num_out=num_classes, last_layer_only=lasrt_layer_only, weight_path=restore_path, device=self.device)
+        self.model = get_default_model_from_params(model_name=model_name, pretrained=True, hidden_layers=hidden_layers, num_out=num_classes, last_layer_only=last_layer_only, weight_path=restore_path, device=self.device)
+        
+        # Accumulating only the params to update
+        print("Params to learn:")
+        if last_layer_only:
+            params_to_update = []
+            for name, param in self.model.named_parameters():
+                if param.requires_grad == True:
+                    params_to_update.append(param)
+                    print("\t", name)
+        else:
+            params_to_update = self.model.parameters()
+            for name, param in self.model.named_parameters():
+                if param.requires_grad == True:
+                    print("\t", name)
+        
+        self.params_to_update = params_to_update
     
     def train_model(self, dataloaders, subprofile_test_epochs = None, num_epochs=1, lr=0.001, momentum=0.9,
-                    validation_freq = 1):
+                    validation_freq = 1,
+                    task_num=None,
+                    save_model=True,
+                    ):
         since = time.time()
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.SGD(self.params_to_update, lr=lr, momentum=momentum)
-        scheduler = ReduceLROnPlateau(optimizer, 'min', verbose=True)
+        scheduler = ReduceLROnPlateau(optimizer, 'min')
 
         val_acc_history = []
         if validation_freq > num_epochs or validation_freq < 1:
@@ -169,6 +196,7 @@ class EkyaModelWrapper(object):
 
         best_model_wts = copy.deepcopy(self.model.state_dict())
         best_acc = 0.0
+        best_epoch=0
 
         profile = []    # List of [timestamp, train metrics, val metrics, test metrics]
         subprofile_test_results = {}
@@ -187,7 +215,7 @@ class EkyaModelWrapper(object):
             for epoch in subprofile_test_epochs.keys():
                 subprofile_test_this_epoch = {}
                 for task_id, task_test_loader in subprofile_test_epochs[epoch].items():
-                    subprofile_test_this_epoch[task_id] = self.infer(task_test_loader)
+                    subprofile_test_this_epoch[task_id], log_items = self.infer(task_test_loader)
                 subprofile_test_results[epoch] = subprofile_test_this_epoch
         
         per_epoch_avg_time = 0
@@ -243,15 +271,15 @@ class EkyaModelWrapper(object):
                         running_loss += loss.item() * inputs.size(0)
                         running_corrects += torch.sum(preds == labels.data)
 
-                        # Print output at every 10%.
-                        if (batch_idx % print_frequency) == 0:
-                            print(
-                                '{} Epoch: {}/{} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.
-                                    format(phase, epoch, num_epochs, batch_idx * len(inputs), len(dataloaders[phase]) * len(inputs),
-                                           100. * batch_idx / len(dataloaders[phase]), loss))
+                        # # Print output at every 10%.
+                        # if (batch_idx % print_frequency) == 0:
+                        #     print(
+                        #         '{} Epoch: {}/{} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.
+                        #             format(phase, epoch, num_epochs, batch_idx * len(inputs), len(dataloaders[phase]) * len(inputs),
+                        #                    100. * batch_idx / len(dataloaders[phase]), loss))
 
                     epoch_loss = running_loss / len(dataloaders[phase].dataset)
-                    epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
+                    epoch_acc = float(running_corrects) / len(dataloaders[phase].dataset)
 
                     if phase == 'train':
                         scheduler.step(epoch_loss)
@@ -265,6 +293,7 @@ class EkyaModelWrapper(object):
                         if epoch_acc > best_acc:
                             best_acc = epoch_acc
                             best_model_wts = copy.deepcopy(self.model.state_dict())
+                            best_epoch = epoch
                     profile_data[phase]['time'] = end_time-start_time
                     profile_data[phase]['loss'] = float(epoch_loss)
                     profile_data[phase]['acc'] = float(epoch_acc)
@@ -279,7 +308,7 @@ class EkyaModelWrapper(object):
                 if epoch in subprofile_test_epochs.keys():
                     subprofile_test_this_epoch = {}
                     for task_id, task_test_loader in subprofile_test_epochs[epoch].items():
-                        subprofile_test_this_epoch[task_id] = self.infer(task_test_loader)
+                        subprofile_test_this_epoch[task_id], log_items = self.infer(task_test_loader)
                     subprofile_test_results[epoch] = subprofile_test_this_epoch
             sgd_time = time.time() - sgd_start_time
             per_epoch_avg_time = (sgd_time)/num_epochs
@@ -293,37 +322,75 @@ class EkyaModelWrapper(object):
 
         # load best model weights
         self.model.load_state_dict(best_model_wts)
+        
+        # Save the best model weights for this tasks training results!
+        if save_model:
+            weight_save_path = os.path.join(self.log_dir, str(self.camera_idx), f"{task_num}.pt")
+            atomic_torch_save(self.model.state_dict(), weight_save_path)
+            model_train_history_df_path = os.path.join(self.log_dir, str(self.camera_idx), "model_train_history.csv")
+            df = pd.DataFrame(
+                {
+                    'weight_save_path': [weight_save_path],
+                    'task_num': [task_num],
+                    'chunk_num': [None],
+                    'hyperparameter_id': [None],
+                    'epoch': [best_epoch],
+                }
+            )
+            if os.path.exists(model_train_history_df_path):
+                prev_df = pd.read_csv(model_train_history_df_path)
+                new_df = pd.concat([prev_df, df], ignore_index=True)
+            else:
+                new_df = df
+            atomic_to_csv(new_df, model_train_history_df_path)
+        
         return self.model, val_acc_history, float(best_acc), profile, subprofile_test_results, misc_return
     
     def infer(self, dataloader):
+        # Actual inference
+        results = defaultdict(list)
+        
         self.model.eval()
         running_corrects = 0
 
         # Iterate over data.
         print_frequency = max(len(dataloader)//10, 10)
         for batch_idx, (inputs, labels) in enumerate(dataloader):
-            inputs = inputs.to(self.device)
-            labels = labels.to(self.device)
+            results["label"].extend(labels.tolist())
+
+            inputs = inputs.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
 
             # forward
             with torch.set_grad_enabled(False):
                 outputs = self.model(inputs)
-                _, preds = torch.max(outputs, 1)
+                
+                # Save the logits
+                results["logits"].extend(outputs.detach().cpu().tolist())
+                
+                probs = F.softmax(outputs, dim=1)
+                maximum_softmaxs, preds = torch.max(probs, dim=1)
+                results["softmax_outputs"].extend(probs.tolist())
+                results["maximum_softmax_output"].extend(maximum_softmaxs.tolist())
+                
+                # Log results (preds, softmax_outputs)
+                results["pred"].extend(preds.tolist())
+                
             num_corrects = torch.sum(preds == labels.data)
             running_corrects += num_corrects
 
-            # Print output at every 10%.
-            if (batch_idx % print_frequency) == 0:
-                print(  'Infer [{}/{} ({:.0f}%)]\tBatch acc: {:.2f}% \tRunning acc: {:.2f}%'.
-                        format(batch_idx * len(inputs), len(dataloader) * len(inputs),
-                               100. * batch_idx / len(dataloader),
-                               num_corrects.double() / len(inputs),
-                               running_corrects.double() / batch_idx * len(inputs)))
+            # # Print output at every 10%.
+            # if (batch_idx % print_frequency) == 0:
+            #     print(  'Infer [{}/{} ({:.0f}%)]\tBatch acc: {:.2f}% \tRunning acc: {:.2f}%'.
+            #             format(batch_idx * len(inputs), len(dataloader) * len(inputs),
+            #                    100. * batch_idx / len(dataloader),
+            #                    float(num_corrects) / len(inputs),
+            #                    float(running_corrects) / batch_idx * len(inputs)))
 
-        acc = running_corrects.double() / len(dataloader.dataset)
+        acc = float(running_corrects) / len(dataloader.dataset)
 
         print('Inference done. Nnet Acc: {:.2f}'.format(acc))
-        return float(acc.double())
+        return float(acc), results
     
     def save(self, path):
         atomic_torch_save(self.model, path)
@@ -336,6 +403,98 @@ class EkyaModelWrapper(object):
 #####################################################################
 
 # Specialized models
+class SimpleMLPModel(nn.Module):
+    def __init__(self, input_size=3*224*224, hidden_layers:Union[int, List[int]]=None, out_size=2, starting_layers:list=None):
+        super().__init__()
+        
+        if isinstance(hidden_layers, int):
+            hidden_layers = [hidden_layers]
+        
+        # Set the initial starting_layers
+        if starting_layers!=None:
+            layers = starting_layers
+        else:
+            layers = []
+        
+        # flattening
+        layers.append(nn.Flatten())
+        
+        current_size = input_size
+        for hidden_size in hidden_layers:
+            layers.append(nn.Linear(current_size, hidden_size))
+            layers.append(nn.ReLU())
+            current_size = hidden_size
+        layers.append(nn.Linear(current_size, out_size))
+        
+        self.model = nn.Sequential(*layers)
+        
+    def forward(self, tensors):
+        # Forward process
+        outputs = self.model(tensors)
+        
+        # Return outputs
+        return outputs
+
+
+# DinoV2FeatureExtractor is a mod of _LinearClassifierWrapper from DinoV2 official repo, especially for layer=4
+class DinoV2FeatureExtractor(nn.Module): 
+    def __init__(self, *, feature_extractor: nn.Module, layers: int = 4):
+        super().__init__()
+        self.feature_extractor = feature_extractor
+        self.layers = layers
+        
+        if self.layers == 1:
+            self.forward_function = self.forward_layer_1
+        elif self.layers == 4:
+            self.forward_function = self.forward_layer_4
+        else:
+            message = f"Unsupported number of layers: {self.layers}, exiting sys"
+            stop_sys(message, raise_error=True)
+        
+    def forward(self, tensors):
+        features = self.forward_function(tensors)
+        return features
+    
+    def forward_layer_1(self, tensors):
+        x = self.feature_extractor.forward_features(tensors)
+        cls_token = x["x_norm_clstoken"]
+        patch_tokens = x["x_norm_patchtokens"]
+        linear_input = torch.cat([
+            cls_token,
+            patch_tokens.mean(dim=1),
+        ], dim=1)
+        return linear_input
+    
+    def forward_layer_4(self, tensors):
+        x = self.feature_extractor.get_intermediate_layers(tensors, n=4, return_class_token=True)
+        linear_input = torch.cat([
+            x[0][1],
+            x[1][1],
+            x[2][1],
+            x[3][1],
+            x[3][0].mean(dim=1),
+        ], dim=1)
+        return linear_input
+
+# DinoV3FeatureExtractor is a mod of _LinearClassifierWrapper from DinoV3 official repo
+class DinoV3FeatureExtractor(nn.Module):
+    def __init__(self, *, feature_extractor:nn.Module):
+        super().__init__()
+        self.feature_extractor = feature_extractor
+        
+    def forward(self, tensors):
+        x = self.feature_extractor.forward_features(tensors)
+        cls_token = x["x_norm_clstoken"]
+        patch_tokens = x["x_norm_patchtokens"]
+        linear_input = torch.cat(
+            [
+                cls_token,
+                patch_tokens.mean(dim=1),
+            ],
+            dim=1,
+        )
+        return linear_input
+        
 class FeatureExtractor(nn.Module):
     def __init__(self, feature_extractor_name, pretrained=True):
         super().__init__()
@@ -489,7 +648,12 @@ def get_default_model_from_params(model_name, pretrained=True, hidden_layers:Uni
     
     # Load Weights
     if weight_path!=None:
-        model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=False))
+        loaded = torch.load(weight_path, map_location=device, weights_only=False)
+        if isinstance(loaded, dict):
+            model.load_state_dict(loaded)
+        else:
+            # Legacy format: full model object was saved instead of state_dict
+            model.load_state_dict(loaded.state_dict())
     
     model = model.to(device)
     
@@ -802,21 +966,3 @@ def remove_classification_heads_get_feature_size(model_name, model):
     
     return feature_extractor, feature_size
     
-def atomic_torch_save(obj, path: str):
-    tmp_path = path + ".tmp"
-    try:
-        # write checkpoint to temp file
-        generate_dirs(path)
-        with open(tmp_path, "wb") as f:
-            torch.save(obj, f, pickle_protocol=5)
-            f.flush()
-            os.fsync(f.fileno())  # flush to disk
-        # replace is atomic
-        os.replace(tmp_path, path)
-    finally:
-        # if something failed, remove tmp
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass

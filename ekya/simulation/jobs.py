@@ -202,7 +202,10 @@ class InferenceJob(EkyaJob):
         # Multiplication factor 0 to 1
         self.perf_vs_res_func = get_infer_profile(
             self.subsampling, self.inference_camera_profile,
-            max_inference_resources=INFER_MAX_RES_DICT[self.model_name])[0]
+            # max_inference_resources=INFER_MAX_RES_DICT[self.model_name])[0] -> Original code, lets fix this to 0.25
+            max_inference_resources=0.25)[0]
+        
+        
         super(InferenceJob, self).__init__(self.job_name, resource_alloc)
         self.res_acc_scale = self.perf_vs_res_func(self.current_resource_alloc)
 
@@ -231,7 +234,8 @@ class InferenceJob(EkyaJob):
         self.model_name = model_name
         self.perf_vs_res_func = get_infer_profile(
             self.subsampling, self.inference_camera_profile,
-            max_inference_resources=INFER_MAX_RES_DICT[self.model_name])[0]
+            # max_inference_resources=INFER_MAX_RES_DICT[self.model_name])[0]
+            max_inference_resources=0.25)[0]
 
     def step(self, wall_time):
         return self.get_accuracy()

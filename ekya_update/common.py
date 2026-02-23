@@ -1,5 +1,9 @@
-import sys, os, pandas as pd, ast, pytz
+import sys, os, pandas as pd, ast, pytz, torch
 from datetime import datetime
+
+# Dino related...
+DINOv3_MODEL_LOCAL_REPO = "../dinov3"  # Dino v3 git cloned dir
+DINOv3_MODEL_WEIGHT_PATH_BASE = "/mnt/hdd_1/models/official_dino_v3/weights/lvd1689m_vit"  # Dino v3 weights path base dir
 
 # Stopping sys
 def stop_sys(message: str = None, raise_error: bool = False, temp_log: str = None):
@@ -50,6 +54,25 @@ def generate_dirs(path):
     if dir_path:  # only if non-empty
         os.makedirs(dir_path, exist_ok=True)
 
+
+def atomic_torch_save(obj, path: str):
+    tmp_path = path + ".tmp"
+    try:
+        # write checkpoint to temp file
+        generate_dirs(path)
+        with open(tmp_path, "wb") as f:
+            torch.save(obj, f, pickle_protocol=5)
+            f.flush()
+            os.fsync(f.fileno())  # flush to disk
+        # replace is atomic
+        os.replace(tmp_path, path)
+    finally:
+        # if something failed, remove tmp
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 # kwargs are used to pass arguments to ".to_csv" function -> ex: pass "index=False" option
 def atomic_to_csv(df: pd.DataFrame, path: str, **kwargs):

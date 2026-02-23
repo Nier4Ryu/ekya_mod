@@ -1,4 +1,4 @@
-import ray, os, time
+import ray, os, time, pandas as pd
 from typing import List
 from torch.utils.data import DataLoader
 from ekya.schedulers.utils import convert_to_ray_demands, quantize_demands
@@ -13,7 +13,10 @@ def inference_executor(camera: CameraSubstitution,
                        num_chunks: int,
                        retraining_period: int,
                        test_batch_size: int,
-                       logger: ray.actor.ActorHandle = None) -> None:
+                       logger: ray.actor.ActorHandle = None,
+                       camera_idx=None,
+                       task_id=None,
+                       ) -> None:
     # WARNING: Camera object is frozen copy at method invocation. Updates to camera wont be reflected in the remote function
     # Parse dataloader and break it into num_chunks
     test_loader = camera._get_dataloader(camera.current_task, test_batch_size=test_batch_size)["test"]
@@ -63,11 +66,12 @@ def inference_executor(camera: CameraSubstitution,
 
         # Result logging
         if logger and log_items:
-            # data = [time.time(), camera.current_task, chunk_id, test_acc]
-            # logger.append.remote("inference_{}".format(camera.id), data)
-            logger.append.remote("inference_{}".format(camera.id), log_items)
-            message = "Logging is currently deprecated"
-            stop_sys(message, raise_error=True)
+            logger.log_inference_results.remote(
+                camera_idx=camera_idx,
+                task_id=task_id,
+                chunk_id=chunk_id,
+                log_items=log_items,
+            )
 
         end_time = time.time()
         chunk_remaining_time = time_per_chunk - (end_time - start_time)
@@ -108,7 +112,6 @@ class EkyaSubstitution(object):
                 model_load_path,
                 
                 # Training Related
-                model_save_path_template,
                 
                 # Scheduler Related
                 scheduler_name,
@@ -123,9 +126,19 @@ class EkyaSubstitution(object):
         # Default Params setup
         self.cameras = cameras
         self.scheduler_name = scheduler_name
+        
+        # New params setup
+        self.model_load_path = model_load_path
+        
+        # Logger Setup
+        self.log_dir = os.path.join(log_dir, "logger_generated")
+        self.logger = ray.remote(LoggerSubstitution).options(num_cpus=0).remote(base_dir=self.log_dir)
+        
         if self.scheduler_name=="thief":
             self.scheduler = ThiefSchedulerSubstitution(
                 scheduler_kwargs=scheduler_kwargs,
+                model_load_path = self.model_load_path,
+                log_dir = self.log_dir,
             )
         else:
             message = f"Currently EkyaSubstitution does not support:{self.scheduler_name}"
@@ -140,20 +153,15 @@ class EkyaSubstitution(object):
         self.num_resources = num_gpus
         self.gpu_memory = gpu_memory
         
-        # New params setup
-        self.model_loadpath = model_load_path
-        self.model_save_path_template = model_save_path_template
         
-        # Logger Setup
-        self.logger = ray.remote(LoggerSubstitution).options(num_cpus=0).remote(base_dir=log_dir)
-
+        
     def update_inference_jobs(self,
                               inference_resource_weights: dict,
                               hyperparameters: dict,
                               ray_inference_resource_demands: dict,
                               blocking: bool = False):
         # Updates inference weights and launches inference exectuoir if not already running
-        for camera in self.cameras:
+        for camera_idx, camera in enumerate(self.cameras):
             this_inference_weight = inference_resource_weights.get(camera.id, 0)
             camera.inference_gpu_weight = this_inference_weight
             if this_inference_weight > 0:
@@ -164,33 +172,34 @@ class EkyaSubstitution(object):
                 #                                                   hyperparameters[camera.id]["model_name"],
                 #                                                   hyperparameters[camera.id]["num_hidden"])
                 
-                message = "How to get pretrained model path here? in update inference jobs?"
-                stop_sys(message, raise_error=True)
-
                 pretrained_model_path = None
                 # Use initial model
                 if self.current_task==0:
-                    pretrained_model_path = self.model_loadpath
+                    pretrained_model_path = self.model_load_path
                 # Use updated model
                 else:
                     # Look into the model train history, find the newest model and use that models path!
                     # Case 1: No model was pretrained before -> just use initial model!
+                    model_train_history_df_path = os.path.join(self.log_dir, str(camera_idx), "model_train_history.csv")
                     if not os.path.exists(model_train_history_df_path):
-                        pretrained_model_path = self.model_loadpath
+                        pretrained_model_path = self.model_load_path
                     # Case 2: Load the most recent one's vals
                     else:
                         model_train_history_df = pd.read_csv(model_train_history_df_path)
+                        weight_save_path = model_train_history_df['weight_save_path'].iloc[-1]
                         prev_task_num = model_train_history_df['task_num'].iloc[-1]
                         chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
                         hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
                         epoch  = model_train_history_df['epoch'].iloc[-1]
 
                         # Check for conflict issues
-                        if task_num > self.current_task:
+                        print(prev_task_num, self.current_task)
+                        if prev_task_num > self.current_task:
                             message = "There was an error in model_train_history_logging, fix this issue!"
                             stop_sys(message, raise_error=True)
                         else:
-                            pretrained_model_path = self.model_save_path_template.format(task_num=prev_task_num, chunk_num=None, hyperparameter_id=None, epoch=None)
+                            pretrained_model_path = weight_save_path
+                            
                 
                 camera.update_inference_model(hyperparameters[camera.id],
                                               this_inference_weight,
@@ -203,7 +212,10 @@ class EkyaSubstitution(object):
                                                                                 num_chunks=self.num_inference_chunks,
                                                                                 retraining_period=self.retraining_period,
                                                                                 test_batch_size=hyperparameters[camera.id]["test_batch_size"],
-                                                                                logger=self.logger)
+                                                                                logger=self.logger,
+                                                                                camera_idx=camera_idx,
+                                                                                task_id=self.current_task,
+                                                                                )
             elif this_inference_weight == 0:
                 print("[WARN][Task {}] Camera {} was assigned 0 or no resources for inference. Not running inference".format(
                     camera.current_task, camera.id))
@@ -216,7 +228,7 @@ class EkyaSubstitution(object):
                              hyperparameters: dict,
                              ray_training_resource_demands: dict):
         if self.current_task > 0:
-            for camera in self.cameras:
+            for camera_idx, camera in enumerate(self.cameras):
                 this_train_weight = training_resource_weights.get(camera.id, 0)
                 camera.training_gpu_weight = this_train_weight
                 # Run retraining only if some resource weight is allocated
@@ -226,18 +238,32 @@ class EkyaSubstitution(object):
                     # pretrained_model_path = get_pretrained_model_format(camera.dataset_name, self.pretrained_model_dir).format(
                     #                                               hyperparameters[camera.id]["model_name"],
                     #                                               hyperparameters[camera.id]["num_hidden"])
-                    message = f"Pretrained model path is not defined in launch training jobs, how to fill this?"
-                    stop_sys(message)
                     
                     pretrained_model_path = None
                     # Use initial model
                     if self.current_task==0:
-                        pretrained_model_path = self.model_loadpath
+                        pretrained_model_path = self.model_load_path
                     # Use updated model
                     else:
-                        hyperparameter_id = None # Maby could get one from hyperparameters?
-                        pretrained_model_path = self.model_save_path_template.format(task_num=self.current_task, chunk_num=None, hyperparameter_id=None, epoch=None)
+                        model_train_history_df_path = os.path.join(self.log_dir, str(camera_idx), "model_train_history.csv")
+                        if not os.path.exists(model_train_history_df_path):
+                            pretrained_model_path = self.model_load_path
+                        else:
+                            model_train_history_df = pd.read_csv(model_train_history_df_path)
+                            weight_save_path = model_train_history_df['weight_save_path'].iloc[-1]
+                            prev_task_num = model_train_history_df['task_num'].iloc[-1]
+                            chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
+                            hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
+                            epoch  = model_train_history_df['epoch'].iloc[-1]
 
+                            # Check for conflict issues
+                            if prev_task_num > self.current_task:
+                                message = "There was an error in model_train_history_logging, fix this issue!"
+                                stop_sys(message, raise_error=True)
+                            else:
+                                pretrained_model_path = weight_save_path
+                        
+                        
                     (self.retraining_tasks[camera.id],
                      self.retraining_metadata[camera.id]) = camera.run_retraining(hyperparameters[camera.id],
                                                                          training_resource_weights[camera.id],
@@ -245,6 +271,7 @@ class EkyaSubstitution(object):
                                                                          dataloaders_dict={},
                                                                          restore_path=pretrained_model_path,
                                                                          profiling_mode=False,
+                                                                         task_num=self.current_task,
                                                                          )
                 else:
                     print("[Task {}] Camera {} was assigned 0 or no resources for retraining. Not retraining.".format(camera.current_task, camera.id))
@@ -262,17 +289,34 @@ class EkyaSubstitution(object):
 
                 # Retrained accuracy logging
                 if self.logger:
-                    # log_time = time.time()
-                    # for i, [best_val_acc, profile, subprofile_test_results, profile_preretrain_test_acc, profile_test_acc, misc_results] in enumerate(retraining_results):
-                    #     retraining_time_taken = log_time - self.last_retraining_start_time
-                    #     camera = done_cameras[i]
-                    #     hp_id = self.current_hyperparameters[camera.id]["id"]
-                    #     hp_epochs = self.current_hyperparameters[camera.id]["epochs"]
-                    #     data = [log_time, camera.current_task, retraining_time_taken, best_val_acc, profile_preretrain_test_acc,
-                    #             profile_test_acc, hp_id, hp_epochs]
-                    #     self.logger.append.remote("retraining_{}".format(camera.id), data)
-                    message = "Logging is currently deprecated"
-                    stop_sys(message, raise_error=True)
+                    log_time = time.time()
+                    for i, [best_val_acc, profile, subprofile_test_results, profile_preretrain_test_acc, profile_test_acc, misc_results] in enumerate(retraining_results):
+                        retraining_time_taken = log_time - self.last_retraining_start_time
+                        camera = done_cameras[i]
+                        hp_id = self.current_hyperparameters[camera.id]["id"]
+                        hp_epochs = self.current_hyperparameters[camera.id]["epochs"]
+                        # data = [log_time, camera.current_task, retraining_time_taken, best_val_acc, profile_preretrain_test_acc,
+                        #         profile_test_acc, hp_id, hp_epochs]
+                        # self.logger.append.remote("retraining_{}".format(camera.id), data)
+                        
+                        camera_idx = int(camera.id)
+                        log_items = {
+                            "camera_idx":[camera_idx],
+                            "task_id":[self.current_task],
+                            "retraining_time_taken":[retraining_time_taken],
+                            "best_val_acc":[best_val_acc],
+                            "profile_preretrain_test_acc":[profile_preretrain_test_acc],
+                            "profile_test_acc":[profile_test_acc], 
+                            "hp_id":[hp_id], 
+                            "hp_epochs":[hp_epochs],
+                            "log_time":[log_time],
+                        }
+                        
+                        self.logger.log_retraining_results.remote(
+                            camera_idx=camera_idx,
+                            task_id=self.current_task,
+                            log_items=log_items,
+                        )
 
                 
                 for c in done_cameras:
@@ -289,7 +333,38 @@ class EkyaSubstitution(object):
                         ray_inference_resource_demands = quantize_demands(ray_inference_resource_demands)
                         # Update the inference model with new retrained weights if inference is running
                         if c.inference_gpu_weight > 0:
-                            c.update_inference_from_retrained_model(path=self.model_save_path_template.format(), current_task=self.current_task, hyperparameter_id=self.current_hyperparameters[x.id])
+                            # Previous
+                            pretrained_model_path = None
+                            
+                            # Use initial model
+                            if self.current_task==0:
+                                pretrained_model_path = self.model_load_path
+                            # Use updated model
+                            else:
+                                # Look into the model train history, find the newest model and use that models path!
+                                # Case 1: No model was pretrained before -> just use initial model!
+                                model_train_history_df_path = os.path.join(self.log_dir, str(camera_idx), "model_train_history.csv")
+                                if not os.path.exists(model_train_history_df_path):
+                                    pretrained_model_path = self.model_load_path
+                                # Case 2: Load the most recent one's vals
+                                else:
+                                    model_train_history_df = pd.read_csv(model_train_history_df_path)
+                                    weight_save_path = model_train_history_df['weight_save_path'].iloc[-1]
+                                    prev_task_num = model_train_history_df['task_num'].iloc[-1]
+                                    chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
+                                    hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
+                                    epoch  = model_train_history_df['epoch'].iloc[-1]
+
+                                    # Check for conflict issues
+                                    if prev_task_num > self.current_task:
+                                        message = "There was an error in model_train_history_logging, fix this issue!"
+                                        stop_sys(message, raise_error=True)
+                                    else:
+                                        pretrained_model_path = weight_save_path
+                            
+                            
+                            c.update_inference_from_retrained_model(path=pretrained_model_path)
+                            
                         # Update remaining cameras' inference weights
                         # NOTE(ROMILB): Updating each inference job's weights through restarts might be expensive
                         # NOTE(ROMILB): Consider parallelizing this.
@@ -306,27 +381,47 @@ class EkyaSubstitution(object):
             if remaining_time <= 0:
                 return
 
+    def _emergency_cleanup(self):
+        """Kill all actors and shut down Ray. Safe to call multiple times."""
+        print("[Ekya] Running emergency cleanup.")
+        try:
+            self.stop_current_jobs()
+        except Exception as e:
+            print(f"[Ekya] stop_current_jobs failed during cleanup: {e}")
+        try:
+            ray.kill(self.logger)
+        except Exception:
+            pass
+        try:
+            ray.shutdown()
+            print("[Ekya] ray.shutdown() done.")
+        except Exception as e:
+            print(f"[Ekya] ray.shutdown failed: {e}")
+
     def run(self):
         '''
         Main loop for Ekya.
         :return:
         '''
-        done = False # This is set to true to exit the loop. Happens when current_task > num_tasks
-        while not done:
-            print("Started loop")
-            this_loop_start_time = time.time()
-            self.last_retraining_start_time = this_loop_start_time
-            # TODO: Make this async:
-            self.new_task_callback()
-            # Check running retraining tasks and load their models into inference when they complete.
-            self.check_task_loop()  # This loop terminates when the time period for the task is done.
+        try:
+            done = False # This is set to true to exit the loop. Happens when current_task > num_tasks
+            while not done:
+                print("Started loop")
+                this_loop_start_time = time.time()
+                self.last_retraining_start_time = this_loop_start_time
+                # TODO: Make this async:
+                self.new_task_callback()
+                # Check running retraining tasks and load their models into inference when they complete.
+                self.check_task_loop()  # This loop terminates when the time period for the task is done.
 
-            # ray.get([self.inference_tasks[c.id] for c in self.cameras])
-            # Stop all jobs. Required to stop any rogue jobs running
-            self.stop_current_jobs()
-            if self.current_task == self.termination_task:   # We have completed the termination task so end here.
-                self.logger.flush.remote()
-                done = True
+                # ray.get([self.inference_tasks[c.id] for c in self.cameras])
+                # Stop all jobs. Required to stop any rogue jobs running
+                self.stop_current_jobs()
+                if self.current_task == self.termination_task:   # We have completed the termination task so end here.
+                    self.logger.flush.remote()
+                    done = True
+        finally:
+            self._emergency_cleanup()
 
     def new_task_callback(self):
         '''
@@ -372,14 +467,20 @@ class EkyaSubstitution(object):
         ray_inference_resource_demands = quantize_demands(ray_inference_resource_demands)
         ray_training_resource_demands = quantize_demands(ray_training_resource_demands)
         print("[Ekya] Training+Inference Scheduler allocation: Training: {}\nInference: {}\n Ray Training: {}\n Ray Inference: {}".format(self.training_resource_weights, self.inference_resource_weights, ray_training_resource_demands, ray_inference_resource_demands))
-        # self.log_schedules(self.current_task, self.inference_resource_weights, self.training_resource_weights, self.current_hyperparameters)
+        self.log_schedules(self.current_task, self.inference_resource_weights, self.training_resource_weights, self.current_hyperparameters)
 
         # Update inference jobs with new weights from the scheduler and launch retraining jobs
         self.update_inference_jobs(self.inference_resource_weights, self.current_hyperparameters, ray_inference_resource_demands)
         self.launch_training_jobs(self.training_resource_weights, self.current_hyperparameters, ray_training_resource_demands)
 
-
-    
+    def log_schedules(self, task_id, inference_resource_weights, training_resource_weights, current_hyperparameters):
+        self.logger.log_schedules.remote(
+            task_id=task_id,
+            inference_resource_weights=inference_resource_weights,
+            training_resource_weights=training_resource_weights,
+            current_hyperparameters=current_hyperparameters,
+        )
+        
     # Original Logic Kept
     def stop_current_jobs(self):
         '''
@@ -415,8 +516,7 @@ class EkyaSubstitution(object):
     # Not touched...
     
     # Deprecated... -> Need to replace logging logics
-    def log_schedules(self):
-        pass
+    
 
     def accumulate_profiles(self, camera_id, task_id):
         pass
