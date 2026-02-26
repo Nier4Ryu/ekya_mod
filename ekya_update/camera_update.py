@@ -14,7 +14,7 @@ from torchvision.transforms import v2 as transforms_v2
 from torchvision.transforms.functional import InterpolationMode
 from ekya.CONFIG import RANDOM_SEED
 from ekya_update.model_update import RayMLModel
-from ekya_update.common import atomic_to_csv, stop_sys, apply_ast_on_col
+from ekya_update.common import atomic_to_csv, stop_sys, apply_ast_on_col, check_mps_is_running
 
 class CameraSubstitution(object):
     # Updated some part at least
@@ -52,49 +52,53 @@ class CameraSubstitution(object):
                 # Logging related
                 log_dir,
                  ):
-        # Setup camera ID
-        self.id = id
-        self.camera_idx = int(self.id) # I prefer int idx as id, just here for safety
-        
-        # Load dfs
-        start_t = time.time()
-        self.train_df = pd.read_csv(train_sample_list_path)
-        self.test_df = pd.read_csv(test_sample_list_path)
-        self.test_golden_df = pd.read_csv(test_golden_sample_list_path)
-        fin_t = time.time()
-        print(f"loading dfs took {fin_t-start_t}s for camera:{self.id}")
+        if not check_mps_is_running():
+            message = "Ekya requires MPS server to be running! stopping sys!"
+            stop_sys(message)
+        else:
+            # Setup camera ID
+            self.id = id
+            self.camera_idx = int(self.id) # I prefer int idx as id, just here for safety
+            
+            # Load dfs
+            start_t = time.time()
+            self.train_df = pd.read_csv(train_sample_list_path)
+            self.test_df = pd.read_csv(test_sample_list_path)
+            self.test_golden_df = pd.read_csv(test_golden_sample_list_path)
+            fin_t = time.time()
+            print(f"loading dfs took {fin_t-start_t}s for camera:{self.id}")
 
 
-        # Save additional infos
-        self.dataset_name = dataset_name
-        self.num_tasks = num_tasks
-        self.num_chunks = num_chunks
-        self.start_task = start_task
-        self.termination_task = termination_task
+            # Save additional infos
+            self.dataset_name = dataset_name
+            self.num_tasks = num_tasks
+            self.num_chunks = num_chunks
+            self.start_task = start_task
+            self.termination_task = termination_task
 
-        self.train_split = train_split
-        self.inference_profile_path = inference_profile_path
-        self.max_inference_resources = max_inference_resources
+            self.train_split = train_split
+            self.inference_profile_path = inference_profile_path
+            self.max_inference_resources = max_inference_resources
 
-        self.training_memory_footprint_value = training_memory_footprint_value
-        self.inference_memory_footprint_value = inference_memory_footprint_value
+            self.training_memory_footprint_value = training_memory_footprint_value
+            self.inference_memory_footprint_value = inference_memory_footprint_value
 
-        # Golden model infos
-        self.label_type = label_type
-        self.model_name_for_golden = model_name_for_golden
-        self.num_hidden_for_golden = num_hidden_for_golden
-        self.last_layer_only_for_golden = last_layer_only_for_golden
-        self.model_load_path_for_golden = model_load_path_for_golden
-        
-        # Log dir infos
-        self.log_dir = os.path.join(log_dir, "logger_generated")
+            # Golden model infos
+            self.label_type = label_type
+            self.model_name_for_golden = model_name_for_golden
+            self.num_hidden_for_golden = num_hidden_for_golden
+            self.last_layer_only_for_golden = last_layer_only_for_golden
+            self.model_load_path_for_golden = model_load_path_for_golden
+            
+            # Log dir infos
+            self.log_dir = os.path.join(log_dir, "logger_generated")
 
-        # Internal params to keep track of where to load...
-        self.current_task = -1
-        self.num_samples_per_task = int(len(self.test_df)/self.num_tasks)
-        
-        print("Warning: As realtime inference scaling function is not aquireable without runtime profiling, we use the default ver - labmda x:1")
-        self.inference_scaling_function = lambda x: 1  
+            # Internal params to keep track of where to load...
+            self.current_task = -1
+            self.num_samples_per_task = int(len(self.test_df)/self.num_tasks)
+            
+            print("Warning: As realtime inference scaling function is not aquireable without runtime profiling, we use the default ver - labmda x:1")
+            self.inference_scaling_function = lambda x: 1  
 
     def update_training_model(self,
                               hyperparameters: dict,
@@ -225,6 +229,8 @@ class CameraSubstitution(object):
             atomic_to_csv(val_df, path=val_df_save_path)
             
             # Swap label to golden labels
+            message = "The below golden_label part seems to have a bug, look at it, fix it and than run!"
+            stop_sys(message, raise_error=True)
             if self.label_type=="golden_label":
                 if "golden_label" not in train_df.columns or "golden_label" not in val_df.columns:
                     message = "Error! You need to have golden_label in both the train_df and val_df to use label_type=golden_label"

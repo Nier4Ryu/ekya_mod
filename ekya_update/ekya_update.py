@@ -5,7 +5,7 @@ from ekya.schedulers.utils import convert_to_ray_demands, quantize_demands
 from ekya_update.camera_update import CameraSubstitution
 from ekya_update.logger_update import LoggerSubstitution
 from ekya_update.thief_scheduler_update import ThiefSchedulerSubstitution
-from ekya_update.common import stop_sys
+from ekya_update.common import stop_sys, check_mps_is_running
 
 
 @ray.remote
@@ -123,36 +123,40 @@ class EkyaSubstitution(object):
                 window_size,
                 log_dir,
         ):
-        # Default Params setup
-        self.cameras = cameras
-        self.scheduler_name = scheduler_name
-        
-        # New params setup
-        self.model_load_path = model_load_path
-        
-        # Logger Setup
-        self.log_dir = os.path.join(log_dir, "logger_generated")
-        self.logger = ray.remote(LoggerSubstitution).options(num_cpus=0).remote(base_dir=self.log_dir)
-        
-        if self.scheduler_name=="thief":
-            self.scheduler = ThiefSchedulerSubstitution(
-                scheduler_kwargs=scheduler_kwargs,
-                model_load_path = self.model_load_path,
-                log_dir = self.log_dir,
-            )
+        if not check_mps_is_running():
+            message = "Ekya requires MPS server to be running! stopping sys!"
+            stop_sys(message)
         else:
-            message = f"Currently EkyaSubstitution does not support:{self.scheduler_name}"
-            stop_sys(message, raise_error=True)
-        
-        self.retraining_period = window_size
-        self.num_tasks = num_tasks
-        self.num_inference_chunks = num_chunks
-        self.current_task = start_task-1
-        self.termination_task = termination_task
-        self.last_retraining_start_time = 0
-        self.num_resources = num_gpus
-        self.gpu_memory = gpu_memory
-        
+            # Default Params setup
+            self.cameras = cameras
+            self.scheduler_name = scheduler_name
+            
+            # New params setup
+            self.model_load_path = model_load_path
+            
+            # Logger Setup
+            self.log_dir = os.path.join(log_dir, "logger_generated")
+            self.logger = ray.remote(LoggerSubstitution).options(num_cpus=0).remote(base_dir=self.log_dir)
+            
+            if self.scheduler_name=="thief":
+                self.scheduler = ThiefSchedulerSubstitution(
+                    scheduler_kwargs=scheduler_kwargs,
+                    model_load_path = self.model_load_path,
+                    log_dir = self.log_dir,
+                )
+            else:
+                message = f"Currently EkyaSubstitution does not support:{self.scheduler_name}"
+                stop_sys(message, raise_error=True)
+            
+            self.retraining_period = window_size
+            self.num_tasks = num_tasks
+            self.num_inference_chunks = num_chunks
+            self.current_task = start_task-1
+            self.termination_task = termination_task
+            self.last_retraining_start_time = 0
+            self.num_resources = num_gpus
+            self.gpu_memory = gpu_memory
+            
         
         
     def update_inference_jobs(self,

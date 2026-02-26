@@ -1,9 +1,14 @@
-import sys, os, pandas as pd, ast, pytz, torch
+import sys, os, pandas as pd, ast, pytz, torch, subprocess
 from datetime import datetime
 
 # Dino related...
 DINOv3_MODEL_LOCAL_REPO = "../dinov3"  # Dino v3 git cloned dir
 DINOv3_MODEL_WEIGHT_PATH_BASE = "/mnt/hdd_1/models/official_dino_v3/weights/lvd1689m_vit"  # Dino v3 weights path base dir
+
+def check_mps_is_running():
+    result = subprocess.run(["ps", "-ef"], capture_output=True, text=True)
+    mps_is_running =  "nvidia-cuda-mps" in result.stdout
+    return mps_is_running
 
 # Stopping sys
 def stop_sys(message: str = None, raise_error: bool = False, temp_log: str = None):
