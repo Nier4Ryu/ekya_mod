@@ -1,4 +1,4 @@
-import sys, os, pandas as pd, ast, pytz, torch, subprocess
+import sys, os, uuid, pickle, time, pandas as pd, ast, pytz, torch, subprocess
 from datetime import datetime
 
 # Dino related...
@@ -61,6 +61,7 @@ def generate_dirs(path):
 
 
 def atomic_torch_save(obj, path: str):
+    path = os.path.abspath(path)
     tmp_path = path + ".tmp"
     try:
         # write checkpoint to temp file
@@ -85,6 +86,7 @@ def atomic_to_csv(df: pd.DataFrame, path: str, **kwargs):
     if "index" not in kwargs:
         kwargs["index"] = False
 
+    path = os.path.abspath(path)
     tmp_path = path + ".tmp"
     try:
         generate_dirs(path)
@@ -132,6 +134,22 @@ def append_to_csv(append_item, path: str, **kwargs):
             df.to_csv(f, **kwargs)
             f.flush()
             os.fsync(f.fileno())
+
+
+def save_dict_as_temp_file(data_dict, log_dir):
+    temp_dir = os.path.join(log_dir, "temp")
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_file_name = f"{uuid.uuid4().hex}_{time.time_ns()}.pkl"
+    temp_file_path = os.path.join(temp_dir, temp_file_name)
+    with open(temp_file_path, "wb") as f:
+        pickle.dump(data_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+    return temp_file_path
+
+def load_dict_from_temp_file(temp_file_path):
+    with open(temp_file_path, "rb") as f:
+        data_dict = pickle.load(f)
+    os.remove(temp_file_path)
+    return data_dict
 
 
 # Applying ast.literal.eval on col

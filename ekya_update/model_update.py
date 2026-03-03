@@ -10,7 +10,7 @@ from collections import defaultdict
 from ekya.utils.mps import set_mps_envvars
 from ekya.CONFIG import RANDOM_SEED
 from ekya.utils.helpers import seed_all
-from ekya_update.common import stop_sys, atomic_to_csv, atomic_torch_save, DINOv3_MODEL_LOCAL_REPO, DINOv3_MODEL_WEIGHT_PATH_BASE
+from ekya_update.common import stop_sys, atomic_to_csv, atomic_torch_save, save_dict_as_temp_file, DINOv3_MODEL_LOCAL_REPO, DINOv3_MODEL_WEIGHT_PATH_BASE
 
 """
 This part is from ekya/classes/models.py
@@ -26,10 +26,12 @@ class MLModelSubstitution(object):
                  name='unnamed',
                  camera_idx:int=None,
                  log_dir:str=None,
+                 label_type:str="ground_truth",
                  ):
         self.hyperparameters = hyperparameters
         self.gpu_allocation_percentage = gpu_allocation_percentage
         self.restore_path = restore_path
+        self.label_type = label_type
         set_mps_envvars(gpu_allocation_percentage)
         print("Initializing {}.\n Got ray.get_gpu_ids(): {}".format(name, ray.get_gpu_ids()))
         NUM_CLASSES = self.hyperparameters["num_classes"]
@@ -72,29 +74,28 @@ class MLModelSubstitution(object):
         profile_preretrain_test_acc = None
         profile_test_acc = None
 
-        #if profiling_mode:
-        start_time = time.time()
-        profile_preretrain_test_acc, log_items = self.model.infer(dataloaders_dict['test'])
-        infer_time_pre = time.time() - start_time
-        print("Profile mode: pre-retrain testing took {} seconds and got acc {:.2f}".format(infer_time_pre, profile_preretrain_test_acc))
-        #print("Dataloader: {}".format(dataloaders_dict['test'].dataset.samples))
-        if infer_time_pre > 5:
-            print("[WARNING] Inference is taking too long - make preretrain and post retrain testing only in profile mode.")
+        if profiling_mode:
+            start_time = time.time()
+            profile_preretrain_test_acc, log_items = self.model.infer(dataloaders_dict['test'], label_type=self.label_type)
+            infer_time_pre = time.time() - start_time
+            print("Profile mode: pre-retrain testing took {} seconds and got acc {:.2f}".format(infer_time_pre, profile_preretrain_test_acc))
+            if infer_time_pre > 5:
+                print("[WARNING] Inference is taking too long - make preretrain and post retrain testing only in profile mode.")
 
         retrain_start_time = time.time()
         _, _, best_val_acc, profile, subprofile_test_results, misc_return = self.model.train_model(dataloaders_dict, num_epochs=NUM_EPOCHS, lr=LR,
-                                                                                      momentum=MOMENTUM, validation_freq=validation_freq, task_num=task_num, save_model=save_model)
+                                                                                      momentum=MOMENTUM, validation_freq=validation_freq, task_num=task_num, save_model=save_model, label_type=self.label_type,
+                                                                                      subprofile_test_epochs={})
         retrain_end_time = time.time()
         retrain_time = retrain_end_time - retrain_start_time
 
-        #if profiling_mode:
-        start_time = time.time()
-        profile_test_acc, log_items = self.model.infer(dataloaders_dict['test'])
-        infer_time_post = time.time() - start_time
-        print("Profile mode: post-retrain testing took {} seconds and got acc {:.2f}".format(infer_time_post, profile_test_acc))
-        #print("Dataloader: {}".format(dataloaders_dict['test'].dataset.samples))
-        if infer_time_post > 5:
-            print("[WARNING] Inference is taking too long - make preretrain and post retrain testing only in profile mode.")
+        if profiling_mode:
+            start_time = time.time()
+            profile_test_acc, log_items = self.model.infer(dataloaders_dict['test'], label_type=self.label_type)
+            infer_time_post = time.time() - start_time
+            print("Profile mode: post-retrain testing took {} seconds and got acc {:.2f}".format(infer_time_post, profile_test_acc))
+            if infer_time_post > 5:
+                print("[WARNING] Inference is taking too long - make preretrain and post retrain testing only in profile mode.")
         total_end_time = time.time()
         total_time = total_end_time - total_start_time
         misc_return['total_time'] = total_time
@@ -103,7 +104,8 @@ class MLModelSubstitution(object):
         return best_val_acc, profile, subprofile_test_results, profile_preretrain_test_acc, profile_test_acc, misc_return
 
     def test_acc(self, test_loader: torch.utils.data.DataLoader, resource_scaled=True):
-        test_acc, log_items = self.model.infer(test_loader)
+        test_acc, log_items = self.model.infer(test_loader, label_type=self.label_type)
+        log_items_path = save_dict_as_temp_file(log_items, self.log_dir)
         # Implement scaling with GPU allocation here.
         if resource_scaled:
             scaling_factor = self.inference_scaling_function(self.gpu_allocation_percentage/100)
@@ -113,7 +115,7 @@ class MLModelSubstitution(object):
             scaled_test_acc = scaling_factor * test_acc
         else:
             scaled_test_acc = test_acc
-        return scaled_test_acc, log_items
+        return scaled_test_acc, log_items_path
 
     def save_model(self, path, ):
         '''Checkpoint to disk.'''
@@ -184,6 +186,7 @@ class EkyaModelWrapper(object):
                     validation_freq = 1,
                     task_num=None,
                     save_model=True,
+                    label_type="ground_truth",
                     ):
         since = time.time()
         criterion = nn.CrossEntropyLoss()
@@ -201,7 +204,7 @@ class EkyaModelWrapper(object):
         profile = []    # List of [timestamp, train metrics, val metrics, test metrics]
         subprofile_test_results = {}
 
-        if not subprofile_test_epochs:
+        if subprofile_test_epochs is None:
             if "test" in dataloaders:
                 subprofile_test_epochs = {num_epochs-1: {-1: dataloaders["test"]}}   # -1 = current task
             else:
@@ -215,9 +218,9 @@ class EkyaModelWrapper(object):
             for epoch in subprofile_test_epochs.keys():
                 subprofile_test_this_epoch = {}
                 for task_id, task_test_loader in subprofile_test_epochs[epoch].items():
-                    subprofile_test_this_epoch[task_id], log_items = self.infer(task_test_loader)
+                    subprofile_test_this_epoch[task_id], log_items = self.infer(task_test_loader, label_type=label_type)
                 subprofile_test_results[epoch] = subprofile_test_this_epoch
-        
+
         per_epoch_avg_time = 0
         if dataloaders["train"] is not None:
             print("Training with {} samples.".format(len(dataloaders["train"].dataset)))
@@ -248,18 +251,26 @@ class EkyaModelWrapper(object):
 
                     # Iterate over data.
                     print_frequency = max(len(dataloaders[phase])//10, 10)
-                    for batch_idx, (inputs, labels) in enumerate(dataloaders[phase]):
+                    for batch_idx, (inputs, labels, golden_labels, is_dummy) in enumerate(dataloaders[phase]):
                         inputs = inputs.to(self.device)
                         labels = labels.to(self.device)
+                        golden_labels = golden_labels.to(self.device)
+
 
                         # zero the parameter gradients
                         optimizer.zero_grad()
+
+                        # Select reference labels based on label_type
+                        if label_type == "golden_label":
+                            ref_labels = golden_labels
+                        else:
+                            ref_labels = labels
 
                         # forward
                         # track history if only in train
                         with torch.set_grad_enabled(phase == 'train'):
                             outputs = self.model(inputs)
-                            loss = criterion(outputs, labels)
+                            loss = criterion(outputs, ref_labels)
                             _, preds = torch.max(outputs, 1)
 
                             # backward + optimize only if in training phase
@@ -269,7 +280,7 @@ class EkyaModelWrapper(object):
 
                         # statistics
                         running_loss += loss.item() * inputs.size(0)
-                        running_corrects += torch.sum(preds == labels.data)
+                        running_corrects += torch.sum(preds == ref_labels.data)
 
                         # # Print output at every 10%.
                         # if (batch_idx % print_frequency) == 0:
@@ -308,7 +319,7 @@ class EkyaModelWrapper(object):
                 if epoch in subprofile_test_epochs.keys():
                     subprofile_test_this_epoch = {}
                     for task_id, task_test_loader in subprofile_test_epochs[epoch].items():
-                        subprofile_test_this_epoch[task_id], log_items = self.infer(task_test_loader)
+                        subprofile_test_this_epoch[task_id], log_items = self.infer(task_test_loader, label_type=label_type)
                     subprofile_test_results[epoch] = subprofile_test_this_epoch
             sgd_time = time.time() - sgd_start_time
             per_epoch_avg_time = (sgd_time)/num_epochs
@@ -346,37 +357,45 @@ class EkyaModelWrapper(object):
         
         return self.model, val_acc_history, float(best_acc), profile, subprofile_test_results, misc_return
     
-    def infer(self, dataloader):
+    def infer(self, dataloader, label_type="ground_truth"):
         # Actual inference
         results = defaultdict(list)
-        
+
         self.model.eval()
         running_corrects = 0
 
         # Iterate over data.
         print_frequency = max(len(dataloader)//10, 10)
-        for batch_idx, (inputs, labels) in enumerate(dataloader):
+        for batch_idx, (inputs, labels, golden_labels, is_dummy) in enumerate(dataloader):
             results["label"].extend(labels.tolist())
+            results["golden_label"].extend(golden_labels.tolist())
+            results["is_dummy"].extend(is_dummy.tolist())
 
             inputs = inputs.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
+            golden_labels = golden_labels.to(self.device, non_blocking=True)
 
             # forward
             with torch.set_grad_enabled(False):
                 outputs = self.model(inputs)
-                
+
                 # Save the logits
                 results["logits"].extend(outputs.detach().cpu().tolist())
-                
+
                 probs = F.softmax(outputs, dim=1)
                 maximum_softmaxs, preds = torch.max(probs, dim=1)
                 results["softmax_outputs"].extend(probs.tolist())
                 results["maximum_softmax_output"].extend(maximum_softmaxs.tolist())
-                
+
                 # Log results (preds, softmax_outputs)
                 results["pred"].extend(preds.tolist())
-                
-            num_corrects = torch.sum(preds == labels.data)
+
+            # Measure accuracy against golden_label or ground truth based on label_type
+            if label_type == "golden_label":
+                ref_labels = golden_labels
+            else:
+                ref_labels = labels
+            num_corrects = torch.sum(preds == ref_labels.data)
             running_corrects += num_corrects
 
             # # Print output at every 10%.

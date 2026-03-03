@@ -126,9 +126,8 @@ class ThiefSchedulerSubstitution(BaseScheduler):
         micrprofile_results = {}
         for camera in cameras:
             best_result, results = ray.get(microprof_tasks[camera.id])
-            micrprofile_results[
-                camera.id] = results  # List of [{best_val_acc, hyperparameters, init_time, time_per_epoch, profile_preretrain_test_acc, profile_test_acc}]
-            ray.kill(microprofs[camera.id])  # Kill to free up GPU explicitly
+            micrprofile_results[camera.id] = results  # List of [{best_val_acc, hyperparameters, init_time, time_per_epoch, profile_preretrain_test_acc, profile_test_acc}]
+            ray.get(microprofs[camera.id].cleanup.remote()) # Replaces ray.kill as this causes the system to crash!
         del microprofs
         return micrprofile_results
     
@@ -171,7 +170,7 @@ class ThiefSchedulerSubstitution(BaseScheduler):
             for camera in cameras:
                 SimTrainingCfgs[camera.id] = [
                     generate_training_job(f"{camera.id}_train_{hp['id']}_{epochs}", acc_prediction, runtime_prediction,
-                                          preretrain_acc, model_name=hp['model_name'], oracle=False)
+                                          preretrain_acc, model_name=hp['model_name'], inference_job=SimInferenceJobs[camera.id], oracle=False)
                     for [hp, acc_prediction, runtime_prediction, epochs, preretrain_acc] in profiles[camera.id] if
                     acc_prediction > preretrain_acc]
 
@@ -246,22 +245,22 @@ class ThiefSchedulerSubstitution(BaseScheduler):
                                  inference_resource_weights,
                                  training_resources_weights)
     
-    def get_default_inference_accs(self, cameras, task_id, subsample_rate):
-        tasks = {}
-        for camera in cameras:
-            # Get dataloader and subsample it
-            dataloaders = camera._get_dataloader(task_id=task_id,
-                                                 train_batch_size=self.default_hyperparams["train_batch_size"],
-                                                 test_batch_size=self.default_hyperparams["test_batch_size"],
-                                                 subsample_rate=subsample_rate)
-            subsampled_test_dataloader = subsample_dataloader(dataloaders['test'], subsample_rate)
-            inference_model_actor = ray.get_actor("{}_inference".format(camera.id))
-            tasks[camera.id] = inference_model_actor.test_acc.remote(test_loader=subsampled_test_dataloader,
-                                                                     resource_scaled=False)
-        default_inference_accs = {}
-        for cid, task in tasks.items():
-            default_inference_accs[cid] = ray.get(task)
-        return default_inference_accs
+    # def get_default_inference_accs(self, cameras, task_id, subsample_rate):
+    #     tasks = {}
+    #     for camera in cameras:
+    #         # Get dataloader and subsample it
+    #         dataloaders = camera._get_dataloader(task_id=task_id,
+    #                                              train_batch_size=self.default_hyperparams["train_batch_size"],
+    #                                              test_batch_size=self.default_hyperparams["test_batch_size"],
+    #                                              subsample_rate=subsample_rate)
+    #         subsampled_test_dataloader = subsample_dataloader(dataloaders['test'], subsample_rate)
+    #         inference_model_actor = ray.get_actor("{}_inference".format(camera.id))
+    #         tasks[camera.id] = inference_model_actor.test_acc.remote(test_loader=subsampled_test_dataloader,
+    #                                                                  resource_scaled=False)
+    #     default_inference_accs = {}
+    #     for cid, task in tasks.items():
+    #         default_inference_accs[cid] = ray.get(task)
+    #     return default_inference_accs
     
     # Not touched...
     

@@ -6,7 +6,7 @@ consider the previous version as deprecated
 As trying to follow the previous version, some names may sound strange
 (ex: test samples comes from train_sample_list / train is called pre-train)
 """
-import pandas as pd, ray, os, torch, time
+import pandas as pd, ray, os, torch, time, math
 from ray.exceptions import RayActorError
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
@@ -29,7 +29,8 @@ class CameraSubstitution(object):
                 test_golden_sample_list_path,
 
                 # Dataset Split related
-                num_tasks,
+                fps,
+                slo,
                 num_chunks,
                 start_task,
                 termination_task,
@@ -63,6 +64,7 @@ class CameraSubstitution(object):
             # Load dfs
             start_t = time.time()
             self.train_df = pd.read_csv(train_sample_list_path)
+            self.train_df["is_dummy"] = False
             self.test_df = pd.read_csv(test_sample_list_path)
             self.test_golden_df = pd.read_csv(test_golden_sample_list_path)
             fin_t = time.time()
@@ -71,7 +73,8 @@ class CameraSubstitution(object):
 
             # Save additional infos
             self.dataset_name = dataset_name
-            self.num_tasks = num_tasks
+            self.fps = fps
+            self.slo = slo
             self.num_chunks = num_chunks
             self.start_task = start_task
             self.termination_task = termination_task
@@ -89,16 +92,48 @@ class CameraSubstitution(object):
             self.num_hidden_for_golden = num_hidden_for_golden
             self.last_layer_only_for_golden = last_layer_only_for_golden
             self.model_load_path_for_golden = model_load_path_for_golden
-            
+
             # Log dir infos
             self.log_dir = os.path.join(log_dir, "logger_generated")
 
+            # Derive task parameters from fps and slo
+            self.chunk_size = self.fps * self.slo
+            self.num_samples_per_task = self.chunk_size * self.num_chunks
+            self.num_real_test_samples = len(self.test_df)
+            self.num_tasks = math.ceil(self.num_real_test_samples / self.num_samples_per_task)
+
+            # Mark existing samples as real, then pad for clean divisibility
+            self.test_df["is_dummy"] = False
+            self.test_golden_df["is_dummy"] = False
+            total_samples_needed = self.num_tasks * self.num_samples_per_task
+            num_padding_samples = total_samples_needed - self.num_real_test_samples
+            if num_padding_samples > 0:
+                last_row_test = self.test_df.iloc[[-1]].copy()
+                last_row_test["is_dummy"] = True
+                padding_test_df = pd.concat([last_row_test] * num_padding_samples, ignore_index=True)
+                self.test_df = pd.concat([self.test_df, padding_test_df], ignore_index=True)
+
+                last_row_golden = self.test_golden_df.iloc[[-1]].copy()
+                last_row_golden["is_dummy"] = True
+                padding_golden_df = pd.concat([last_row_golden] * num_padding_samples, ignore_index=True)
+                self.test_golden_df = pd.concat([self.test_golden_df, padding_golden_df], ignore_index=True)
+
+                print(f"Camera {self.id}: Padded {num_padding_samples} dummy samples "
+                      f"(real={self.num_real_test_samples}, total={total_samples_needed})")
+            else:
+                print(f"Camera {self.id}: No padding needed "
+                      f"(real={self.num_real_test_samples}, total={total_samples_needed})")
+
+            # Add golden_label column to test_df from golden model predictions
+            self.test_df["golden_label"] = self.test_golden_df["pred"].values
+            # For train_df, no golden model predictions exist — use ground truth as fallback
+            self.train_df["golden_label"] = self.train_df["label"].values
+
             # Internal params to keep track of where to load...
             self.current_task = -1
-            self.num_samples_per_task = int(len(self.test_df)/self.num_tasks)
-            
+
             print("Warning: As realtime inference scaling function is not aquireable without runtime profiling, we use the default ver - labmda x:1")
-            self.inference_scaling_function = lambda x: 1  
+            self.inference_scaling_function = lambda x: 1
 
     def update_training_model(self,
                               hyperparameters: dict,
@@ -114,10 +149,14 @@ class CameraSubstitution(object):
         if hasattr(self, "training_model"):
             try:
                 ray.get(self.training_model.__ray_terminate__.remote())
-                ray.kill(self.training_model, no_restart=True)
             except RayActorError:
                 # Model already killed
                 pass
+            finally:
+                try:
+                    ray.kill(self.training_model, no_restart=True)
+                except Exception:
+                    pass
         model_updated = False
         while not model_updated:
             try:
@@ -128,6 +167,7 @@ class CameraSubstitution(object):
                     name="{}_training".format(self.id),
                     camera_idx=self.camera_idx,
                     log_dir=self.log_dir,
+                    label_type=self.label_type,
                     )
                 model_updated = True
             except ValueError as e:
@@ -180,7 +220,8 @@ class CameraSubstitution(object):
                         test_batch_size: int = 1,
                         num_workers: int = 4,
                         subsample_rate: float = 1,
-                        shuffle: bool = False):
+                        shuffle: bool = False,
+                        save_csv: bool = True):
 
         # Generate Test dataset for all cases
         dataloaders_dict = {
@@ -191,13 +232,8 @@ class CameraSubstitution(object):
         
         # Generate Train / Val datasets for task_id>0
         if task_id>0:
-            # Set col "golden_label" for test_df
-            if self.label_type=="golden_label":
-                temp_test_df = self.test_df.copy()
-                temp_test_df.insert(0, "golden_label", self.test_golden_df["pred"].values)
-            else:
-                temp_test_df = self.test_df.copy()
-                
+            temp_test_df = self.test_df.copy()
+
             # Generate Train / Val dfs
             # Sample from Test samples (Use previous window history only)
             train_and_val_candidate_from_test_indexes = temp_test_df.iloc[self.num_samples_per_task * (task_id - 1):self.num_samples_per_task * task_id]
@@ -225,31 +261,10 @@ class CameraSubstitution(object):
             val_df_save_path = os.path.join(self.log_dir, "runtime_logs", "val", f"task_{task_id}.csv")
             
             # Save train / val dfs
-            atomic_to_csv(train_df, path=train_df_save_path)
-            atomic_to_csv(val_df, path=val_df_save_path)
+            if save_csv:
+                atomic_to_csv(train_df, path=train_df_save_path)
+                atomic_to_csv(val_df, path=val_df_save_path)
             
-            # Swap label to golden labels
-            message = "The below golden_label part seems to have a bug, look at it, fix it and than run!"
-            stop_sys(message, raise_error=True)
-            if self.label_type=="golden_label":
-                if "golden_label" not in train_df.columns or "golden_label" not in val_df.columns:
-                    message = "Error! You need to have golden_label in both the train_df and val_df to use label_type=golden_label"
-                    stop_sys(message, raise_error=True)
-                else:
-                    train_df["label"] = train_df["golden_label"].fillna(train_df["label"])
-                    train_df.drop(columns=["label"], inplace=True)
-                    train_df.rename(columns={"golden_label": "label"}, inplace=True)
-                    val_df["label"] = val_df["golden_label"].fillna(val_df["label"])
-                    val_df.drop(columns=["label"], inplace=True)
-                    val_df.rename(columns={"golden_label": "label"}, inplace=True)
-            else:
-                # Try to drop golden_label if it exists
-                if "golden_label" in train_df.columns:
-                    train_df.drop(columns=["golden_label"], inplace=True)
-                    
-                if "golden_label" in val_df.columns:
-                    val_df.drop(columns=["golden_label"], inplace=True)
-                
             dataloaders_dict["train"] = get_train_dataloader_from_df(df=train_df, batch_size=train_batch_size, num_workers=num_workers)
             dataloaders_dict["val"] = get_inference_dataloader_from_df(df=val_df, batch_size=test_batch_size, num_workers=num_workers)
 
@@ -278,7 +293,12 @@ class CameraSubstitution(object):
             except RayActorError as e:
                 # Model already killed
                 print("Got exception while killing model. Continuing. {}".format(str(e)))
-                pass
+            finally:
+                # Force-kill to remove name from Ray's name registry (Ray 2.54+ retains name after exit_actor())
+                try:
+                    ray.kill(self.inference_model, no_restart=True)
+                except Exception:
+                    pass
         model_updated = False
         while not model_updated:
             try:
@@ -290,6 +310,7 @@ class CameraSubstitution(object):
                     name="{}_inference".format(self.id),
                     camera_idx=self.camera_idx,
                     log_dir=self.log_dir,
+                    label_type=self.label_type,
                     )
                 model_updated = True
             except ValueError as e:
@@ -342,15 +363,15 @@ class CameraSubstitution(object):
         stop_sys(message, raise_error=True)
     
 # Implementations from Lite
-def get_train_dataloader_from_df(df, batch_size, input_size=(224,224), return_vals="img_tensor_and_label", num_workers=4):
+def get_train_dataloader_from_df(df, batch_size, input_size=(224,224), return_vals="img_tensor_and_label_and_golden_label", num_workers=4):
     mixed_dataset = MixedDatasetPILV2(df, train=True, input_size=input_size, return_vals=return_vals)
-    dataloader = DataLoader(mixed_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, prefetch_factor=1, pin_memory=True, persistent_workers=True) # persistent_workers=True for train function as dataset is static
+    dataloader = DataLoader(mixed_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, prefetch_factor=1, pin_memory=True, persistent_workers=True, multiprocessing_context="spawn") # persistent_workers=True for train function as dataset is static
     return dataloader
 
-def get_inference_dataloader_from_df(df, batch_size, input_size=(224, 224), return_vals="img_tensor_and_label", task_num=None, total_task_num=None, num_workers=4, prefetch_factor=1):
+def get_inference_dataloader_from_df(df, batch_size, input_size=(224, 224), return_vals="img_tensor_and_label_and_golden_label", task_num=None, total_task_num=None, num_workers=4, prefetch_factor=1):
     df = get_df_partition_from_params(df, task_num=task_num, total_task_num=total_task_num)
     mixed_dataset = MixedDatasetPILV2(df, train=False, input_size=input_size, return_vals=return_vals)
-    dataloader = DataLoader(mixed_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, prefetch_factor=prefetch_factor, pin_memory=True)
+    dataloader = DataLoader(mixed_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, prefetch_factor=prefetch_factor, pin_memory=True, multiprocessing_context="spawn")
     return dataloader
 
 def get_df_partition_from_params(df, task_num=None, total_task_num=None):
@@ -368,20 +389,24 @@ def get_df_partition_from_params(df, task_num=None, total_task_num=None):
 
 # Dataset 
 class MixedDataset(Dataset):
-    def __init__(self, df, return_vals="img_tensor_and_label"):
+    def __init__(self, df, return_vals="img_tensor_and_label_and_golden_label"):
         # Decide cols to keep (Reduce memory), return_func (What values are required)
         self.df = df.copy()
         cols_to_keep = []
         if return_vals=="img_tensor_and_label":
-            cols_to_keep.extend(["label", "img_save_path"])
+            cols_to_keep.extend(["label", "img_save_path", "is_dummy"])
             self.df = self.df[cols_to_keep]
             self.return_func = self.return_func_img_tensor_and_label
+        elif return_vals=="img_tensor_and_label_and_golden_label":
+            cols_to_keep.extend(["label", "golden_label", "img_save_path", "is_dummy"])
+            self.df = self.df[cols_to_keep]
+            self.return_func = self.return_func_img_tensor_and_label_golden_label
         elif return_vals=="img_tensor_and_label_and_feature_save_path_template":
-            cols_to_keep.extend(["label", "img_save_path", "feature_save_path_template"])
+            cols_to_keep.extend(["label", "img_save_path", "feature_save_path_template", "is_dummy"])
             self.df = self.df[cols_to_keep]
             self.return_func = self.return_func_img_tensor_and_label_and_feature_save_path_template
         elif return_vals=="img_tensor_and_soft_label":
-            cols_to_keep.extend(["img_save_path", "soft_label"])
+            cols_to_keep.extend(["img_save_path", "soft_label", "is_dummy"])
             self.df = self.df[cols_to_keep]
             self.return_func = self.return_func_img_tensor_and_soft_label
             
@@ -410,33 +435,41 @@ class MixedDataset(Dataset):
     # -------- shared return funcs --------
     def return_func_img_tensor_and_label(self, idx):
         row = self.df.iloc[idx]
-        
-        label, img_save_path = row["label"], row["img_save_path"]
+
+        label, img_save_path, is_dummy = row["label"], row["img_save_path"], row["is_dummy"]
         transformed_img = self.load_and_transform_img(img_save_path)
-        
-        return transformed_img, label
-    
+
+        return transformed_img, label, is_dummy
+
+    def return_func_img_tensor_and_label_golden_label(self, idx):
+        row = self.df.iloc[idx]
+
+        label, golden_label, img_save_path, is_dummy = row["label"], row["golden_label"], row["img_save_path"], row["is_dummy"]
+        transformed_img = self.load_and_transform_img(img_save_path)
+
+        return transformed_img, label, golden_label, is_dummy
+
     def return_func_img_tensor_and_label_and_feature_save_path_template(self, idx):
         row = self.df.iloc[idx]
-        
-        label, img_save_path, feature_save_path_template = row["label"], row["img_save_path"], row["feature_save_path_template"]
+
+        label, img_save_path, feature_save_path_template, is_dummy = row["label"], row["img_save_path"], row["feature_save_path_template"], row["is_dummy"]
         transformed_img = self.load_and_transform_img(img_save_path)
-        
-        return transformed_img, label, feature_save_path_template
+
+        return transformed_img, label, feature_save_path_template, is_dummy
 
     def return_func_img_tensor_and_soft_label(self, idx):
         row = self.df.iloc[idx]
-        img_save_path, soft_label = row["img_save_path"], row["soft_label"]
+        img_save_path, soft_label, is_dummy = row["img_save_path"], row["soft_label"], row["is_dummy"]
         transformed_img = self.load_and_transform_img(img_save_path)
-        
-        return transformed_img, soft_label
+
+        return transformed_img, soft_label, is_dummy
 
     # -------- abstract hooks --------
     def load_and_transform_img(self, img_save_path):
         raise NotImplementedError
 
 class MixedDatasetPILV2(MixedDataset):
-    def __init__(self, df, train, input_size=(224,224), return_vals="img_tensor_and_label"):
+    def __init__(self, df, train, input_size=(224,224), return_vals="img_tensor_and_label_and_golden_label"):
         super().__init__(df, return_vals=return_vals)
         
         if train:

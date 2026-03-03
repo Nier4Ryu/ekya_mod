@@ -13,19 +13,22 @@ def inference_executor(camera: CameraSubstitution,
                        num_chunks: int,
                        retraining_period: int,
                        test_batch_size: int,
+                       window_start_time: float,
                        logger: ray.actor.ActorHandle = None,
                        camera_idx=None,
                        task_id=None,
                        ) -> None:
     # WARNING: Camera object is frozen copy at method invocation. Updates to camera wont be reflected in the remote function
     # Parse dataloader and break it into num_chunks
-    test_loader = camera._get_dataloader(camera.current_task, test_batch_size=test_batch_size)["test"]
+    test_loader = camera._get_dataloader(camera.current_task, test_batch_size=test_batch_size, save_csv=False)["test"]
     test_dataset = test_loader.dataset
     index = test_dataset.get_indexes()
     chunk_size = len(test_dataset)//num_chunks
-    time_per_chunk = retraining_period//num_chunks
+    remaining_time = retraining_period - (time.time() - window_start_time)
+    time_per_chunk = remaining_time/num_chunks
     print("[InferenceExecutor] Initializing inference executor for camera {}. Total samples in task: {}. Chunk size: "
-          "{}. Time per chunk: {}".format(camera.id, len(test_dataset), chunk_size, time_per_chunk))
+          "{}. Time per chunk: {:.2f} (remaining: {:.2f}s of {}s window)".format(
+              camera.id, len(test_dataset), chunk_size, time_per_chunk, remaining_time, retraining_period))
 
     test_accs = []
 
@@ -47,30 +50,30 @@ def inference_executor(camera: CameraSubstitution,
         chunk_loader = DataLoader(chunk_dataset,
                                               batch_size=test_loader.batch_size,
                                               shuffle=False,
-                                              num_workers=test_loader.num_workers)
+                                              num_workers=0)
         # Try to fetch the latest actor handle from ray until successful
         inference_model_actor = fetch_actor()
         retry_count = 0
         test_acc = None
-        log_items = None
+        log_items_path = None
         while test_acc is None and retry_count < 5:
             try:
-                test_acc, log_items = ray.get(inference_model_actor.test_acc.remote(test_loader=chunk_loader))
-            except:
+                test_acc, log_items_path = ray.get(inference_model_actor.test_acc.remote(test_loader=chunk_loader))
+            except Exception as e:
                 retry_count+=1
-                print("[InferenceExecutor][WARNING] Test_acc task failed. Retrying. Attempt: {}".format(retry_count))
+                print("[InferenceExecutor][WARNING] Test_acc task failed with {}: {}. Retrying. Attempt: {}".format(type(e).__name__, str(e)[:200], retry_count))
                 inference_model_actor = fetch_actor()
                 test_acc = None
         print("[InferenceExecutor] {}: Got test acc: {}".format(camera.id, test_acc))
         test_accs.append(test_acc)
 
         # Result logging
-        if logger and log_items:
+        if logger and log_items_path:
             logger.log_inference_results.remote(
                 camera_idx=camera_idx,
                 task_id=task_id,
                 chunk_id=chunk_id,
-                log_items=log_items,
+                log_items_path=log_items_path,
             )
 
         end_time = time.time()
@@ -105,7 +108,6 @@ class EkyaSubstitution(object):
                 cameras,
                 start_task,
                 termination_task,
-                num_tasks,
                 num_chunks,
 
                 # Model Related
@@ -149,10 +151,20 @@ class EkyaSubstitution(object):
                 stop_sys(message, raise_error=True)
             
             self.retraining_period = window_size
-            self.num_tasks = num_tasks
+            # Derive num_tasks from cameras and verify all streams agree
+            num_tasks_per_camera = [camera.num_tasks for camera in cameras]
+            if len(set(num_tasks_per_camera)) != 1:
+                message = (f"All cameras must have the same num_tasks derived from fps/slo/df_length, "
+                           f"but got: {num_tasks_per_camera}")
+                stop_sys(message, raise_error=True)
+            else:
+                self.num_tasks = num_tasks_per_camera[0]
             self.num_inference_chunks = num_chunks
             self.current_task = start_task-1
-            self.termination_task = termination_task
+            if termination_task == -1:
+                self.termination_task = self.num_tasks - 1
+            else:
+                self.termination_task = termination_task
             self.last_retraining_start_time = 0
             self.num_resources = num_gpus
             self.gpu_memory = gpu_memory
@@ -216,6 +228,7 @@ class EkyaSubstitution(object):
                                                                                 num_chunks=self.num_inference_chunks,
                                                                                 retraining_period=self.retraining_period,
                                                                                 test_batch_size=hyperparameters[camera.id]["test_batch_size"],
+                                                                                window_start_time=self.last_retraining_start_time,
                                                                                 logger=self.logger,
                                                                                 camera_idx=camera_idx,
                                                                                 task_id=self.current_task,
@@ -277,6 +290,8 @@ class EkyaSubstitution(object):
                                                                          profiling_mode=False,
                                                                          task_num=self.current_task,
                                                                          )
+                    print("[TRAINING START][Task {}] Camera {} training started. hp_id={}, epochs={}, restore_path={}".format(
+                        self.current_task, camera.id, hyperparameters[camera.id]["id"], hyperparameters[camera.id]["epochs"], pretrained_model_path))
                 else:
                     print("[Task {}] Camera {} was assigned 0 or no resources for retraining. Not retraining.".format(camera.current_task, camera.id))
 
@@ -290,6 +305,11 @@ class EkyaSubstitution(object):
                 retraining_results = ray.get(done_tasks)
                 done_camera_ids = [next(camera_id for camera_id, task_id in self.retraining_tasks.items() if task_id == t) for t in done_tasks]
                 done_cameras = [next(c for c in self.cameras if c.id == i) for i in done_camera_ids]
+
+                for done_camera_idx, done_camera in enumerate(done_cameras):
+                    done_best_val_acc = retraining_results[done_camera_idx][0]
+                    print("[TRAINING FIN][Task {}] Camera {} training finished. best_val_acc={:.4f}".format(
+                        self.current_task, done_camera.id, done_best_val_acc))
 
                 # Retrained accuracy logging
                 if self.logger:
@@ -339,7 +359,7 @@ class EkyaSubstitution(object):
                         if c.inference_gpu_weight > 0:
                             # Previous
                             pretrained_model_path = None
-                            
+
                             # Use initial model
                             if self.current_task==0:
                                 pretrained_model_path = self.model_load_path
@@ -347,7 +367,7 @@ class EkyaSubstitution(object):
                             else:
                                 # Look into the model train history, find the newest model and use that models path!
                                 # Case 1: No model was pretrained before -> just use initial model!
-                                model_train_history_df_path = os.path.join(self.log_dir, str(camera_idx), "model_train_history.csv")
+                                model_train_history_df_path = os.path.join(self.log_dir, str(int(c.id)), "model_train_history.csv")
                                 if not os.path.exists(model_train_history_df_path):
                                     pretrained_model_path = self.model_load_path
                                 # Case 2: Load the most recent one's vals
@@ -368,7 +388,9 @@ class EkyaSubstitution(object):
                             
                             
                             c.update_inference_from_retrained_model(path=pretrained_model_path)
-                            
+                            print("[MODEL UPDATE][Task {}] Camera {} inference model updated with retrained weights. path={}".format(
+                                self.current_task, c.id, pretrained_model_path))
+
                         # Update remaining cameras' inference weights
                         # NOTE(ROMILB): Updating each inference job's weights through restarts might be expensive
                         # NOTE(ROMILB): Consider parallelizing this.
@@ -422,7 +444,6 @@ class EkyaSubstitution(object):
                 # Stop all jobs. Required to stop any rogue jobs running
                 self.stop_current_jobs()
                 if self.current_task == self.termination_task:   # We have completed the termination task so end here.
-                    self.logger.flush.remote()
                     done = True
         finally:
             self._emergency_cleanup()
@@ -516,7 +537,14 @@ class EkyaSubstitution(object):
         return inference_memory_demands, training_memory_demands
 
     
-    
+    def shutdown(self):
+        message = f"This is the shutdown pahse for Ekya, make any post processings here on the runtime results"
+        stop_sys(message)
+        
+        self.fin_file_path = os.path.join(self.log_dir, "fin.log")
+        with open(self.fin_file_path, "w") as f:
+            f.write("done\n")
+        
     # Not touched...
     
     # Deprecated... -> Need to replace logging logics

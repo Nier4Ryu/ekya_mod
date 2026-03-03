@@ -1,4 +1,4 @@
-import os, time, ray, torch, numpy as np
+import gc, os, time, ray, torch, numpy as np
 from typing import List
 from torch.utils.data import Subset
 from ekya_update.model_update import MLModelSubstitution
@@ -28,6 +28,7 @@ def microprofile(hyperparameters: dict,
                         val_loader=dataloaders['val'],
                         test_loader=dataloaders['test'],
                         hyperparameters=hyperparameters,
+                        profiling_mode=True,
                         task_num=task_num,
                         save_model=False, # For micro profiling do not save the model!
                         )
@@ -56,7 +57,7 @@ def subsample_dataloader(dataloader: torch.utils.data.DataLoader,
     subsampled_dataloader = torch.utils.data.DataLoader(subsampled_dataset,
                                                         batch_size=dataloader.batch_size,
                                                         shuffle=False,
-                                                        num_workers=dataloader.num_workers)
+                                                        num_workers=0)
     return subsampled_dataloader
 
 def resample_substitution(dataset, num_to_subsample):
@@ -79,6 +80,11 @@ class SimpleMicroprofilerSubstitution(BaseMicroprofiler):
     def __init__(self, device='cuda'):
         assert device in ['cuda', 'cpu', 'auto']
         self.device = device
+
+    def cleanup(self):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
     def run_microprofiling(self,
                            candidate_hyperparams: List[dict],

@@ -1,6 +1,6 @@
 import time, os, pandas as pd
 from collections import defaultdict
-from ekya_update.common import append_to_csv, get_kst_as_string, stop_sys, atomic_to_csv
+from ekya_update.common import append_to_csv, get_kst_as_string, stop_sys, atomic_to_csv, load_dict_from_temp_file
 
 
 class LoggerSubstitution:
@@ -9,14 +9,17 @@ class LoggerSubstitution:
         self.stream_max_len = stream_max_len
         self.base_dir = base_dir
         
+        self.fin_file_path = os.path.join(self.base_dir, "fin.log")
+                
         # Rename previous results
-        if os.path.exists(self.base_dir):
+        if os.path.exists(self.base_dir) and os.path.exists(self.fin_file_path):
             prev_dir_new_path = f"{self.base_dir}_replaced_on_{get_kst_as_string()}"
             os.rename(self.base_dir, prev_dir_new_path)
 
     # Below are logging during runtime
-    def log_inference_results(self, camera_idx, task_id, chunk_id, log_items):
+    def log_inference_results(self, camera_idx, task_id, chunk_id, log_items_path):
         inference_result_log_path = os.path.join(self.base_dir, "runtime", "inference", f"camera_{camera_idx}_task_{task_id}_chunk_{chunk_id}.csv")
+        log_items = load_dict_from_temp_file(log_items_path)
         df = pd.DataFrame(log_items)
         atomic_to_csv(df, inference_result_log_path)
     
