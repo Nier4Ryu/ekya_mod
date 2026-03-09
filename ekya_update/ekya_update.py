@@ -124,6 +124,9 @@ class EkyaSubstitution(object):
                 gpu_memory,
                 window_size,
                 log_dir,
+
+                # Resume Related
+                resume_from_task=None,
         ):
         if not check_mps_is_running():
             message = "Ekya requires MPS server to be running! stopping sys!"
@@ -132,14 +135,14 @@ class EkyaSubstitution(object):
             # Default Params setup
             self.cameras = cameras
             self.scheduler_name = scheduler_name
-            
+
             # New params setup
             self.model_load_path = model_load_path
-            
+
             # Logger Setup
             self.log_dir = os.path.join(log_dir, "logger_generated")
             self.logger = ray.remote(LoggerSubstitution).options(num_cpus=0).remote(base_dir=self.log_dir)
-            
+
             if self.scheduler_name=="thief":
                 self.scheduler = ThiefSchedulerSubstitution(
                     scheduler_kwargs=scheduler_kwargs,
@@ -149,7 +152,7 @@ class EkyaSubstitution(object):
             else:
                 message = f"Currently EkyaSubstitution does not support:{self.scheduler_name}"
                 stop_sys(message, raise_error=True)
-            
+
             self.retraining_period = window_size
             # Derive num_tasks from cameras and verify all streams agree
             num_tasks_per_camera = [camera.num_tasks for camera in cameras]
@@ -160,7 +163,12 @@ class EkyaSubstitution(object):
             else:
                 self.num_tasks = num_tasks_per_camera[0]
             self.num_inference_chunks = num_chunks
-            self.current_task = start_task-1
+            if resume_from_task is not None:
+                self.current_task = resume_from_task - 1
+                print(f"[RESUME] EkyaSubstitution initialized with resume_from_task={resume_from_task}, "
+                      f"current_task set to {self.current_task}")
+            else:
+                self.current_task = start_task - 1
             if termination_task == -1:
                 self.termination_task = self.num_tasks - 1
             else:
@@ -537,11 +545,11 @@ class EkyaSubstitution(object):
         return inference_memory_demands, training_memory_demands
 
     
-    def shutdown(self):
-        message = f"This is the shutdown pahse for Ekya, make any post processings here on the runtime results"
-        stop_sys(message)
+    def shutdown(self, fin_file_path):
+        # message = f"This is the shutdown pahse for Ekya, make any post processings here on the runtime results"
+        # stop_sys(message)
         
-        self.fin_file_path = os.path.join(self.log_dir, "fin.log")
+        self.fin_file_path = fin_file_path
         with open(self.fin_file_path, "w") as f:
             f.write("done\n")
         

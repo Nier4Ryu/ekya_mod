@@ -245,19 +245,22 @@ class CameraSubstitution(object):
             train_from_test_df = temp_test_df.loc[train_from_test_indexes]
             val_from_test_df = temp_test_df.loc[val_from_test_indexes]
             
-            # Sample from Train samples (Use all of train -> May need to cut the bounds... lets cut up to "num_samples_to_pick_from_test")
-            train_and_val_candidate_from_train_indexes = self.train_df
-            num_samples_to_pick_from_train = min(max(int(len(train_and_val_candidate_from_train_indexes) * subsample_rate), 2), num_samples_to_pick_from_test)
-            num_samples_to_pick_from_train_for_train = int(num_samples_to_pick_from_train * self.train_split)
-            train_and_val_from_train_indexes = train_and_val_candidate_from_train_indexes.sample(n=num_samples_to_pick_from_train, random_state=RANDOM_SEED).index
-            train_from_train_indexes = train_and_val_from_train_indexes[:num_samples_to_pick_from_train_for_train]
-            val_from_train_indexes = train_and_val_from_train_indexes[num_samples_to_pick_from_train_for_train:]
-            train_from_train_df = self.train_df.loc[train_from_train_indexes]
-            val_from_train_df = self.train_df.loc[val_from_train_indexes]
+            # Sample from Train/Previous window samples (Window 1:Use pre-train / Window 2~:Use -previous window as it exists!)
+            if task_id == 1:
+                train_and_val_candidate_from_train_indexes = self.train_df
+            else:
+                train_and_val_candidate_from_train_indexes = temp_test_df.iloc[self.num_samples_per_task * (task_id - 2):self.num_samples_per_task * (task_id-1)]
+            num_samples_to_pick_from_train_or_previous_window_ = min(max(int(len(train_and_val_candidate_from_train_indexes) * subsample_rate), 2), num_samples_to_pick_from_test)
+            num_samples_to_pick_from_train_or_previous_window_for_train = int(num_samples_to_pick_from_train_or_previous_window_ * self.train_split)
+            train_and_val_from_train_or_previous_window_indexes = train_and_val_candidate_from_train_indexes.sample(n=num_samples_to_pick_from_train_or_previous_window_, random_state=RANDOM_SEED).index
+            train_from_train_or_previous_window_indexes = train_and_val_from_train_or_previous_window_indexes[:num_samples_to_pick_from_train_or_previous_window_for_train]
+            val_from_train_or_previous_window_indexes = train_and_val_from_train_or_previous_window_indexes[num_samples_to_pick_from_train_or_previous_window_for_train:]
+            train_from_train_or_previous_window_df = train_and_val_candidate_from_train_indexes.loc[train_from_train_or_previous_window_indexes]
+            val_from_train_or_previous_window_df = train_and_val_candidate_from_train_indexes.loc[val_from_train_or_previous_window_indexes]
             
-            train_df = pd.concat([train_from_test_df, train_from_train_df])
+            train_df = pd.concat([train_from_test_df, train_from_train_or_previous_window_df])
             train_df_save_path = os.path.join(self.log_dir, "runtime_logs", "train", f"task_{task_id}.csv")
-            val_df = pd.concat([val_from_test_df, val_from_train_df])
+            val_df = pd.concat([val_from_test_df, val_from_train_or_previous_window_df])
             val_df_save_path = os.path.join(self.log_dir, "runtime_logs", "val", f"task_{task_id}.csv")
             
             # Save train / val dfs

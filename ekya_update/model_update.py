@@ -638,7 +638,7 @@ class FeatureAndOutputModel(nn.Module):
         outputs = self.fc_layers(features)
         return features, outputs
 
-def get_default_model_from_params(model_name, pretrained=True, hidden_layers:Union[int, List[int]]=None, num_out=6, last_layer_only=False, weight_path=None, device='cpu'):
+def get_default_model_from_params(model_name, pretrained=True, hidden_layers:Union[int, List[int]]=None, num_out=6, last_layer_only=False, weight_path=None, device='cpu', return_val="output"):
     # Generate Model
     # 1) MoE model case -> str name should be given as {moe_type}|MoEModel|{model_name}
     if "MoEModel" in model_name:
@@ -651,7 +651,7 @@ def get_default_model_from_params(model_name, pretrained=True, hidden_layers:Uni
             model_name = data['model_name']
             
             if moe_type == "Conditional":
-                model = ConditionalMoEModel(num_experts, model_name, pretrained=pretrained, hidden_layers=hidden_layers, num_out=num_out, last_layer_only=last_layer_only, return_val="output")
+                model = ConditionalMoEModel(num_experts, model_name, pretrained=pretrained, hidden_layers=hidden_layers, num_out=num_out, last_layer_only=last_layer_only, return_val=return_val)
             elif moe_type == "Matryoshka":
                 message = "Currently in the implementation stage of MatryshkaMoEModel, please implement it first"
                 stop_sys(message, raise_error=True)
@@ -663,7 +663,7 @@ def get_default_model_from_params(model_name, pretrained=True, hidden_layers:Uni
             stop_sys(message, raise_error=True)
     else:
         # This is actually a feature_and_output_model with reuturn_func set to outputs
-        model = FeatureAndOutputModel(model_name, pretrained=pretrained, hidden_layers=hidden_layers, num_out=num_out, last_layer_only=last_layer_only, return_val="output")
+        model = FeatureAndOutputModel(model_name, pretrained=pretrained, hidden_layers=hidden_layers, num_out=num_out, last_layer_only=last_layer_only, return_val=return_val)
     
     # Load Weights
     if weight_path!=None:
