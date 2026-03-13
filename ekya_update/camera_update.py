@@ -45,7 +45,7 @@ class CameraSubstitution(object):
                 # Ekya System Related
                 train_split,
                 inference_profile_path,
-                max_inference_resources,
+                min_inference_resources_to_meet_slo, # Originally max_inference_resources in Ekya's original code (ekya/simulation/jobs.py)
 
                 training_memory_footprint_value,
                 inference_memory_footprint_value,
@@ -81,7 +81,7 @@ class CameraSubstitution(object):
 
             self.train_split = train_split
             self.inference_profile_path = inference_profile_path
-            self.max_inference_resources = max_inference_resources
+            self.min_inference_resources_to_meet_slo = min_inference_resources_to_meet_slo
 
             self.training_memory_footprint_value = training_memory_footprint_value
             self.inference_memory_footprint_value = inference_memory_footprint_value
@@ -355,7 +355,7 @@ class CameraSubstitution(object):
 
     # Deprecated...
     @staticmethod
-    def get_infer_profile(max_inference_resources=1,
+    def get_infer_profile(min_inference_resources_to_meet_slo=1,
                           profile_path='real_inference_profiles.csv',
                           camera='c1'):
         message = f"This function is deprecated, please check if this is really needed"
