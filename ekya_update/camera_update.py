@@ -7,6 +7,7 @@ As trying to follow the previous version, some names may sound strange
 (ex: test samples comes from train_sample_list / train is called pre-train)
 """
 import pandas as pd, ray, os, torch, time, math
+from lite.src.utils.common import warn_user
 from ray.exceptions import RayActorError
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
@@ -14,7 +15,24 @@ from torchvision.transforms import v2 as transforms_v2
 from torchvision.transforms.functional import InterpolationMode
 from ekya.CONFIG import RANDOM_SEED
 from ekya_update.model_update import RayMLModel
-from ekya_update.common import atomic_to_csv, stop_sys, apply_ast_on_col, check_mps_is_running
+from ekya_update.common import atomic_to_csv, stop_sys, apply_ast_on_col, check_mps_is_running, logical_to_physical_gpu
+from ekya.utils.dataset_utils import get_normalize_params_from_model_name
+
+IMAGENET_NORMALIZE_PARAMS = {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}
+GOOGLE_VIT_NORMALIZE_PARAMS = {"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]}
+
+def get_input_size_from_model_name(model_name):
+    if model_name=="ViT_Tiny_EVA02_336":
+        input_size=(336, 336)
+    elif model_name=="ViT_Small_EVA02_336":
+        input_size=(336, 336)
+    elif model_name=="ViT_Base_EVA02_448":
+        input_size=(448, 448)
+    elif model_name=="ViT_Large_EVA02_448":
+        input_size=(448, 448)
+    else:
+        input_size=(224, 224)
+    return input_size
 
 class CameraSubstitution(object):
     # Updated some part at least
@@ -52,6 +70,9 @@ class CameraSubstitution(object):
 
                 # Logging related
                 log_dir,
+
+                # Multi-stream alignment: when num_streams > 1, align df length to target_num_samples
+                target_num_samples=None,
                  ):
         if not check_mps_is_running():
             message = "Ekya requires MPS server to be running! stopping sys!"
@@ -99,6 +120,33 @@ class CameraSubstitution(object):
             # Derive task parameters from fps and slo
             self.chunk_size = self.fps * self.slo
             self.num_samples_per_task = self.chunk_size * self.num_chunks
+
+            # Multi-stream alignment: truncate or elongate df to match target stream length
+            # Only used when num_streams > 1
+            if target_num_samples is not None:
+                original_len = len(self.test_df)
+                if original_len > target_num_samples:
+                    self.test_df = self.test_df.iloc[:target_num_samples].reset_index(drop=True)
+                    self.test_golden_df = self.test_golden_df.iloc[:target_num_samples].reset_index(drop=True)
+                    warn_user(f"Camera {self.id}: Truncated from {original_len} to {target_num_samples} samples", warning_time=0)
+                elif original_len < target_num_samples:
+                    num_extra = target_num_samples - original_len
+                    num_full_repeats = num_extra // original_len
+                    num_remainder = num_extra % original_len
+
+                    extra_test_dfs = [self.test_df] * num_full_repeats
+                    if num_remainder > 0:
+                        extra_test_dfs.append(self.test_df.iloc[:num_remainder])
+                    extra_golden_dfs = [self.test_golden_df] * num_full_repeats
+                    if num_remainder > 0:
+                        extra_golden_dfs.append(self.test_golden_df.iloc[:num_remainder])
+
+                    self.test_df = pd.concat([self.test_df] + extra_test_dfs, ignore_index=True)
+                    self.test_golden_df = pd.concat([self.test_golden_df] + extra_golden_dfs, ignore_index=True)
+                    warn_user(f"Camera {self.id}: Elongated from {original_len} to {target_num_samples} samples", warning_time=0)
+                else:
+                    print(f"Camera {self.id}: Already at target {target_num_samples} samples")
+
             self.num_real_test_samples = len(self.test_df)
             self.num_tasks = math.ceil(self.num_real_test_samples / self.num_samples_per_task)
 
@@ -137,38 +185,56 @@ class CameraSubstitution(object):
 
     def update_training_model(self,
                               hyperparameters: dict,
-                              training_gpu_weight: float,
-                              ray_resource_demand: float,
+                              gpu_fraction: float,
                               restore_path: str = "",
                               blocking: bool = False):
         self.hyperparameters = hyperparameters
-        self.training_gpu_weight = training_gpu_weight
-        self.training_ray_demand = ray_resource_demand
-        
-        # Kill the existing model by waiting it to terminate any running tasks
+        self.training_gpu_fraction = gpu_fraction
+
+        # Kill existing training actor immediately (force-kill, no graceful shutdown)
+        # Previous approach: graceful terminate then force-kill (could delay resource release)
+        # if hasattr(self, "training_model"):
+        #     try:
+        #         ray.get(self.training_model.__ray_terminate__.remote())
+        #     except RayActorError:
+        #         pass
+        #     finally:
+        #         try:
+        #             ray.kill(self.training_model, no_restart=True)
+        #         except Exception:
+        #             pass
         if hasattr(self, "training_model"):
             try:
-                ray.get(self.training_model.__ray_terminate__.remote())
-            except RayActorError:
-                # Model already killed
+                ray.kill(self.training_model, no_restart=True)
+            except Exception:
                 pass
-            finally:
-                try:
-                    ray.kill(self.training_model, no_restart=True)
-                except Exception:
-                    pass
+            del self.training_model
         model_updated = False
         while not model_updated:
             try:
-                self.training_model = RayMLModel.options(name="{}_training".format(self.id), num_gpus=self.training_ray_demand).remote(
+                gpu_idx=0
+                physical_gpu=logical_to_physical_gpu(gpu_idx)
+                gpu_percent = int(self.training_gpu_fraction)
+                print(f"[Training] for {self.id} GPU:{gpu_percent}%  Allocated")
+                self.training_model = RayMLModel.options(
+                    name="{}_training".format(self.id),
+                    num_gpus=0.01,
+                    resources={f"GPU{gpu_idx}": self.training_gpu_fraction / 100},
+                    runtime_env={
+                        "env_vars":{
+                            "CUDA_VISIBLE_DEVICES": physical_gpu,
+                            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(gpu_percent)
+                        }
+                    }
+                ).remote(
                     hyperparameters=self.hyperparameters,
-                    gpu_allocation_percentage=self.training_gpu_weight,
+                    gpu_allocation_percentage=self.training_gpu_fraction,
                     restore_path=restore_path,
                     name="{}_training".format(self.id),
                     camera_idx=self.camera_idx,
                     log_dir=self.log_dir,
                     label_type=self.label_type,
-                    )
+                )
                 model_updated = True
             except ValueError as e:
                 # print("Got value error {}. Retrying..".format(e))
@@ -179,19 +245,20 @@ class CameraSubstitution(object):
 
     def run_retraining(self,
                        hyperparameters: dict,
-                       training_gpu_weight: float,
-                       ray_resource_demand: float,
+                       gpu_fraction: float,
                        dataloaders_dict: dict = {},
                        validation_freq: int = -1,
                        restore_path: str = "",
                        profiling_mode: bool = False,
                        task_num=None,
+                       window_end_time=None,
                        ):
-        self.update_training_model(hyperparameters, training_gpu_weight, ray_resource_demand, restore_path=restore_path, blocking=False)
+        self.update_training_model(hyperparameters, gpu_fraction, restore_path=restore_path, blocking=False)
         if not dataloaders_dict:
             dataloaders_dict = self._get_dataloader(self.current_task,
                                                     train_batch_size=hyperparameters["train_batch_size"],
-                                                    subsample_rate=hyperparameters["subsample"])
+                                                    subsample_rate=hyperparameters["subsample"],
+                                                    model_name=hyperparameters.get("model_name", None))
         
         if profiling_mode:
             message = f"Currently profiling mode is de-activated for camera_update, revert back to ekya or please implement it"
@@ -206,6 +273,7 @@ class CameraSubstitution(object):
             dataloaders_dict['test'], hyperparameters,
             validation_freq, profiling_mode,
             task_num=task_num,
+            window_end_time=window_end_time,
             )
         
         return task, metadata
@@ -221,13 +289,14 @@ class CameraSubstitution(object):
                         num_workers: int = 4,
                         subsample_rate: float = 1,
                         shuffle: bool = False,
-                        save_csv: bool = True):
+                        save_csv: bool = True,
+                        model_name: str = None):
 
         # Generate Test dataset for all cases
         dataloaders_dict = {
             "train":None,
             "val":None,
-            "test":get_inference_dataloader_from_df(df=self.test_df.iloc[self.num_samples_per_task * task_id:self.num_samples_per_task * (task_id + 1)], batch_size=test_batch_size),
+            "test":get_inference_dataloader_from_df(df=self.test_df.iloc[self.num_samples_per_task * task_id:self.num_samples_per_task * (task_id + 1)], batch_size=test_batch_size, model_name=model_name),
         }
         
         # Generate Train / Val datasets for task_id>0
@@ -259,17 +328,17 @@ class CameraSubstitution(object):
             val_from_train_or_previous_window_df = train_and_val_candidate_from_train_indexes.loc[val_from_train_or_previous_window_indexes]
             
             train_df = pd.concat([train_from_test_df, train_from_train_or_previous_window_df])
-            train_df_save_path = os.path.join(self.log_dir, "runtime_logs", "train", f"task_{task_id}.csv")
+            train_df_save_path = os.path.join(self.log_dir, "runtime_logs", "train", f"camera_{self.camera_idx}_task_{task_id}.csv")
             val_df = pd.concat([val_from_test_df, val_from_train_or_previous_window_df])
-            val_df_save_path = os.path.join(self.log_dir, "runtime_logs", "val", f"task_{task_id}.csv")
+            val_df_save_path = os.path.join(self.log_dir, "runtime_logs", "val", f"camera_{self.camera_idx}_task_{task_id}.csv")
             
             # Save train / val dfs
             if save_csv:
                 atomic_to_csv(train_df, path=train_df_save_path)
                 atomic_to_csv(val_df, path=val_df_save_path)
             
-            dataloaders_dict["train"] = get_train_dataloader_from_df(df=train_df, batch_size=train_batch_size, num_workers=num_workers)
-            dataloaders_dict["val"] = get_inference_dataloader_from_df(df=val_df, batch_size=test_batch_size, num_workers=num_workers)
+            dataloaders_dict["train"] = get_train_dataloader_from_df(df=train_df, batch_size=train_batch_size, model_name=model_name, num_workers=num_workers)
+            dataloaders_dict["val"] = get_inference_dataloader_from_df(df=val_df, batch_size=test_batch_size, model_name=model_name, num_workers=num_workers)
 
         return dataloaders_dict
 
@@ -279,42 +348,59 @@ class CameraSubstitution(object):
     
     def update_inference_model(self,
                                hyperparameters: dict,
-                               inference_gpu_weight: float,
-                               ray_resource_demand: float,
+                               gpu_fraction: float,
                                restore_path: str = "",
                                blocking: bool = False):
         self.hyperparameters = hyperparameters
-        self.inference_gpu_weight = inference_gpu_weight
-        self.inference_ray_demand = ray_resource_demand
-        
+        self.inference_gpu_fraction = gpu_fraction
+
         self.current_inference_path = restore_path or self.current_inference_path  # Use restore path if specified, else use current_inference_path
-        
-        # Kill the existing model by waiting it to terminate any running tasks
+
+        # Kill existing inference actor immediately (force-kill, no graceful shutdown)
+        # Previous approach: graceful terminate then force-kill (could delay resource release)
+        # if hasattr(self, "inference_model"):
+        #     try:
+        #         ray.get(self.inference_model.__ray_terminate__.remote())
+        #     except RayActorError as e:
+        #         print("Got exception while killing model. Continuing. {}".format(str(e)))
+        #     finally:
+        #         try:
+        #             ray.kill(self.inference_model, no_restart=True)
+        #         except Exception:
+        #             pass
         if hasattr(self, "inference_model"):
             try:
-                ray.get(self.inference_model.__ray_terminate__.remote())
-            except RayActorError as e:
-                # Model already killed
-                print("Got exception while killing model. Continuing. {}".format(str(e)))
-            finally:
-                # Force-kill to remove name from Ray's name registry (Ray 2.54+ retains name after exit_actor())
-                try:
-                    ray.kill(self.inference_model, no_restart=True)
-                except Exception:
-                    pass
+                ray.kill(self.inference_model, no_restart=True)
+            except Exception:
+                pass
+            del self.inference_model
         model_updated = False
         while not model_updated:
             try:
-                self.inference_model = RayMLModel.options(name="{}_inference".format(self.id), num_gpus=self.inference_ray_demand).remote(
+                gpu_idx=0
+                physical_gpu=logical_to_physical_gpu(gpu_idx)
+                gpu_percent = int(self.inference_gpu_fraction)
+                print(f"[Inference] for {self.id} GPU:{gpu_percent}% Allocated")
+                self.inference_model = RayMLModel.options(
+                    name="{}_inference".format(self.id),
+                    num_gpus=0.01,
+                    resources={f"GPU{gpu_idx}": self.inference_gpu_fraction / 100},
+                    runtime_env={
+                        "env_vars":{
+                            "CUDA_VISIBLE_DEVICES": physical_gpu,
+                            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(gpu_percent)
+                        }
+                    }
+                ).remote(
                     hyperparameters=self.hyperparameters,
-                    gpu_allocation_percentage=self.inference_gpu_weight,
+                    gpu_allocation_percentage=self.inference_gpu_fraction,
                     inference_scaling_function=self.inference_scaling_function,
                     restore_path=self.current_inference_path,
                     name="{}_inference".format(self.id),
                     camera_idx=self.camera_idx,
                     log_dir=self.log_dir,
                     label_type=self.label_type,
-                    )
+                )
                 model_updated = True
             except ValueError as e:
                 pass  # Retrying
@@ -329,18 +415,22 @@ class CameraSubstitution(object):
             stop_sys(message)
         
         ray.get(self.training_model.save_model.remote(path))
-        # Kill training model after it is saved.
+        # Kill training actor immediately after save (force-kill, no graceful shutdown)
+        # Previous approach: graceful terminate (could delay resource release)
+        # try:
+        #     ray.get(self.training_model.__ray_terminate__.remote())
+        # except RayActorError as e:
+        #     print("Got exception while killing model. Continuing. {}".format(str(e)))
+        #     pass
         try:
-            ray.get(self.training_model.__ray_terminate__.remote())
-        except RayActorError as e:
-            # Model already killed
-            print("Got exception while killing model. Continuing. {}".format(str(e)))
+            ray.kill(self.training_model, no_restart=True)
+        except Exception:
             pass
+        del self.training_model
         self.current_inference_path = path
         print("{}, request update {}".format(self.id, self))
         self.update_inference_model(self.hyperparameters,
-                                    self.inference_gpu_weight,
-                                    self.inference_ray_demand,
+                                    self.inference_gpu_fraction,
                                     restore_path=self.current_inference_path)
     
     def training_memory_footprint(self):
@@ -366,14 +456,14 @@ class CameraSubstitution(object):
         stop_sys(message, raise_error=True)
     
 # Implementations from Lite
-def get_train_dataloader_from_df(df, batch_size, input_size=(224,224), return_vals="img_tensor_and_label_and_golden_label", num_workers=4):
-    mixed_dataset = MixedDatasetPILV2(df, train=True, input_size=input_size, return_vals=return_vals)
+def get_train_dataloader_from_df(df, batch_size, model_name=None, return_vals="img_tensor_and_label_and_golden_label", num_workers=4):
+    mixed_dataset = MixedDatasetPILV2(df, train=True, model_name=model_name, return_vals=return_vals)
     dataloader = DataLoader(mixed_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, prefetch_factor=1, pin_memory=True, persistent_workers=True, multiprocessing_context="spawn") # persistent_workers=True for train function as dataset is static
     return dataloader
 
-def get_inference_dataloader_from_df(df, batch_size, input_size=(224, 224), return_vals="img_tensor_and_label_and_golden_label", task_num=None, total_task_num=None, num_workers=4, prefetch_factor=1):
+def get_inference_dataloader_from_df(df, batch_size, model_name=None, return_vals="img_tensor_and_label_and_golden_label", task_num=None, total_task_num=None, num_workers=4, prefetch_factor=1):
     df = get_df_partition_from_params(df, task_num=task_num, total_task_num=total_task_num)
-    mixed_dataset = MixedDatasetPILV2(df, train=False, input_size=input_size, return_vals=return_vals)
+    mixed_dataset = MixedDatasetPILV2(df, train=False, model_name=model_name, return_vals=return_vals)
     dataloader = DataLoader(mixed_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, prefetch_factor=prefetch_factor, pin_memory=True, multiprocessing_context="spawn")
     return dataloader
 
@@ -472,9 +562,12 @@ class MixedDataset(Dataset):
         raise NotImplementedError
 
 class MixedDatasetPILV2(MixedDataset):
-    def __init__(self, df, train, input_size=(224,224), return_vals="img_tensor_and_label_and_golden_label"):
+    def __init__(self, df, train, model_name=None, return_vals="img_tensor_and_label_and_golden_label"):
         super().__init__(df, return_vals=return_vals)
-        
+
+        input_size = get_input_size_from_model_name(model_name)
+        normalize_params = get_normalize_params_from_model_name(model_name)
+
         if train:
             self.transform = transforms_v2.Compose([
                 transforms_v2.Resize(
@@ -485,7 +578,7 @@ class MixedDatasetPILV2(MixedDataset):
                 transforms_v2.RandAugment(interpolation=InterpolationMode.BILINEAR),
                 transforms_v2.ToImage(),
                 transforms_v2.ToDtype(torch.float32, scale=True),
-                transforms_v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                transforms_v2.Normalize(mean=normalize_params["mean"], std=normalize_params["std"]),
             ])
         else:
             self.transform = transforms_v2.Compose([
@@ -496,7 +589,7 @@ class MixedDatasetPILV2(MixedDataset):
                 ),
                 transforms_v2.ToImage(),
                 transforms_v2.ToDtype(torch.float32, scale=True),
-                transforms_v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                transforms_v2.Normalize(mean=normalize_params["mean"], std=normalize_params["std"]),
             ])
         
     def load_and_transform_img(self, img_save_path):

@@ -30,7 +30,7 @@ def convert_to_ray_demands(inference_memory_demand: dict,
     ray_inference_resource_demands = {}
     ray_training_resource_demands = {}
 
-    # Scale resource weights from 0-100 to 0-1
+    # Scale resource weights from 0-100 to 0-1 (scheduler outputs 0-100, Ray uses 0-1)
     i_wts = {k: v/100 for k,v in inference_resource_weights.items()}
     t_wts = {k: v/100 for k,v in training_resource_weights.items()}
 

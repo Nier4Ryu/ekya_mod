@@ -46,7 +46,12 @@ class LoggerSubstitution:
         
         df = pd.DataFrame(results)
         df = df.sort_values(by=["task_id", "camera_idx"], ascending=True)
-        schedule_result_log_path = os.path.join(self.base_dir, "runtime", "schedules", f"task_{task_id}.csv")
+        schedule_dir = os.path.join(self.base_dir, "runtime", "schedules")
+        postfix = 1
+        schedule_result_log_path = os.path.join(schedule_dir, f"task_{task_id}_{postfix}.csv")
+        while os.path.exists(schedule_result_log_path):
+            postfix += 1
+            schedule_result_log_path = os.path.join(schedule_dir, f"task_{task_id}_{postfix}.csv")
         atomic_to_csv(df, schedule_result_log_path)
         
     def log_retraining_results(self, camera_idx, task_id, log_items):

@@ -3,6 +3,8 @@ from typing import List
 from torch.utils.data import Subset
 from ekya_update.model_update import MLModelSubstitution
 from ekya.microprofilers.base_microprofiler import BaseMicroprofiler
+from ekya_update.common import stop_sys, logical_to_physical_gpu
+
 
 def microprofile(hyperparameters: dict,
                  epochs: dict,
@@ -47,7 +49,6 @@ def microprofile(hyperparameters: dict,
         }
     return ret_val
 
-
 def subsample_dataloader(dataloader: torch.utils.data.DataLoader,
                          subsample_rate: float):
     # if dataloader is None:
@@ -76,6 +77,13 @@ def resample_substitution(dataset, num_to_subsample):
         
     return Subset(dataset, resample_idxs.tolist())
 
+@ray.remote
+class MicroprofileActor:
+    """Ray actor for microprofiling. Killing the actor releases the CUDA context."""
+    def run(self, hyperparameters, epochs, dataloaders, res_alloc, pretrained_model_path, device, task_num, camera_idx=None, log_dir=None):
+        return microprofile(hyperparameters, epochs, dataloaders, res_alloc, pretrained_model_path, device, task_num, camera_idx, log_dir)
+
+
 class SimpleMicroprofilerSubstitution(BaseMicroprofiler):
     def __init__(self, device='cuda'):
         assert device in ['cuda', 'cpu', 'auto']
@@ -98,17 +106,47 @@ class SimpleMicroprofilerSubstitution(BaseMicroprofiler):
                            log_dir:str=None,
                            ) -> dict:
         assert len(dataloaders) == len(candidate_hyperparams)
-        microprofile_task = ray.remote(microprofile)
-        tasks = []
-        resources_per_trial = resources # Change to a fraction to run multiple simultaneously
+        results = []
+        resources_per_trial = resources / 4  # Upto "N" parallel ray workers! 
 
-        for hp, hp_dataloaders in zip(candidate_hyperparams, dataloaders):
-            subsampled_dataloaders = {mode: subsample_dataloader(d, subsample_rate) for mode,d in hp_dataloaders.items()}
-            if self.device == 'cuda':
-                resource_params = {'num_gpus': resources_per_trial}
-            elif self.device == 'cpu':
-                resource_params = {'num_cpus': resources_per_trial}
-            tasks.append(microprofile_task.options(**resource_params).remote(hp, epochs, subsampled_dataloaders, resources_per_trial, pretrained_model_path, self.device, task_num, camera_idx, log_dir))
-        results = ray.get(tasks)
+        if self.device == 'cpu':
+            message = "profiling in CPU is impossible in my standard, what is this??"
+            stop_sys(message, raise_error=True)
+        else:
+            gpu_idx = 0
+            physical_gpu = logical_to_physical_gpu(gpu_idx)
+            gpu_percent = int(resources_per_trial*100)
+            print(f"[Micro profiling] Allocation:{gpu_percent} Allocated")
+
+            # Submit all tasks upfront — Ray schedules at most "N" concurrently
+            # due to the GPU0 resource constraint
+            future_to_actor = {}
+            futures = []
+            for hp, hp_dataloaders in zip(candidate_hyperparams, dataloaders):
+                subsampled_dataloaders = {mode: subsample_dataloader(d, subsample_rate) for mode, d in hp_dataloaders.items()}
+                actor = MicroprofileActor.options(
+                    num_gpus=0.01,
+                    resources={f"GPU{gpu_idx}": resources_per_trial},
+                    runtime_env={
+                        "env_vars": {
+                            "CUDA_VISIBLE_DEVICES": physical_gpu,
+                            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(gpu_percent)
+                        }
+                    }
+                ).remote()
+                future = actor.run.remote(
+                    hp, epochs, subsampled_dataloaders, resources_per_trial, pretrained_model_path, self.device, task_num, camera_idx, log_dir
+                )
+                future_to_actor[future] = actor
+                futures.append(future)
+
+            # Drain results one-by-one as each finishes — no idle waiting
+            remaining = list(futures)
+            while remaining:
+                done, remaining = ray.wait(remaining, num_returns=1)
+                result = ray.get(done[0])
+                ray.kill(future_to_actor[done[0]], no_restart=True)
+                results.append(result)
+
         best_result = max(results, key=lambda i: i['test_acc'])
         return best_result, results

@@ -1,11 +1,25 @@
 import ray, os, time, pandas as pd
 from typing import List
 from torch.utils.data import DataLoader
-from ekya.schedulers.utils import convert_to_ray_demands, quantize_demands
 from ekya_update.camera_update import CameraSubstitution
 from ekya_update.logger_update import LoggerSubstitution
 from ekya_update.thief_scheduler_update import ThiefSchedulerSubstitution
-from ekya_update.common import stop_sys, check_mps_is_running
+from ekya_update.common import stop_sys, check_mps_is_running, logical_to_physical_gpu
+
+
+@ray.remote
+class RetrainFinTracker:
+    def __init__(self):
+        self.status = {}
+
+    def init(self, camera_ids):
+        self.status = {cid: False for cid in camera_ids}
+
+    def set(self, camera_id, value):
+        self.status[camera_id] = value
+
+    def all_done(self):
+        return all(self.status.values())
 
 
 @ray.remote
@@ -14,6 +28,7 @@ def inference_executor(camera: CameraSubstitution,
                        retraining_period: int,
                        test_batch_size: int,
                        window_start_time: float,
+                       retrain_fin_tracker: ray.actor.ActorHandle = None,
                        logger: ray.actor.ActorHandle = None,
                        camera_idx=None,
                        task_id=None,
@@ -79,8 +94,13 @@ def inference_executor(camera: CameraSubstitution,
         end_time = time.time()
         chunk_remaining_time = time_per_chunk - (end_time - start_time)
         if chunk_remaining_time > 0:
-            print("Chunk {}/{} done. Sleeping for {:.2f}".format(chunk_id, num_chunks, chunk_remaining_time))
-            time.sleep(chunk_remaining_time)
+            all_retrain_done = retrain_fin_tracker is not None and ray.get(retrain_fin_tracker.all_done.remote())
+            if all_retrain_done:
+                print("Chunk {}/{} done. All retraining finished, sleeping 0.1s".format(chunk_id, num_chunks))
+                time.sleep(0.1)
+            else:
+                print("Chunk {}/{} done. Sleeping for {:.2f}".format(chunk_id, num_chunks, chunk_remaining_time))
+                time.sleep(chunk_remaining_time)
         else:
             # TODO: Log warning: Throughput is less than line rate.
             print("Warning: Inference xput is less than line rate in chunk {}, camera {}".format(chunk_id, camera.id))
@@ -121,7 +141,6 @@ class EkyaSubstitution(object):
                 
                 # Resource Related
                 num_gpus,
-                gpu_memory,
                 window_size,
                 log_dir,
 
@@ -174,23 +193,19 @@ class EkyaSubstitution(object):
             else:
                 self.termination_task = termination_task
             self.last_retraining_start_time = 0
+            self.retrain_fin_tracker = RetrainFinTracker.options(num_cpus=0).remote()
             self.num_resources = num_gpus
-            self.gpu_memory = gpu_memory
             
         
         
     def update_inference_jobs(self,
-                              inference_resource_weights: dict,
                               hyperparameters: dict,
-                              ray_inference_resource_demands: dict,
+                              gpu_inference_fractions: dict,
                               blocking: bool = False):
-        # Updates inference weights and launches inference exectuoir if not already running
+        # Updates inference weights and launches inference executor if not already running
         for camera_idx, camera in enumerate(self.cameras):
-            this_inference_weight = inference_resource_weights.get(camera.id, 0)
-            camera.inference_gpu_weight = this_inference_weight
-            if this_inference_weight > 0:
-                this_inference_ray_demand = ray_inference_resource_demands[camera.id]
-                camera.inference_ray_demand = this_inference_ray_demand
+            this_gpu_fraction = gpu_inference_fractions.get(camera.id, 0)
+            if this_gpu_fraction > 0:
                 # Set the weights on the inference job and load the pretrained default model
                 # pretrained_model_path = get_pretrained_model_format(camera.dataset_name, self.pretrained_model_dir).format(
                 #                                                   hyperparameters[camera.id]["model_name"],
@@ -226,22 +241,23 @@ class EkyaSubstitution(object):
                             
                 
                 camera.update_inference_model(hyperparameters[camera.id],
-                                              this_inference_weight,
-                                              this_inference_ray_demand,
+                                              this_gpu_fraction,
                                               restore_path=pretrained_model_path,
                                               blocking=blocking)
                 if camera.id not in self.inference_tasks:
                     # Run inference executor if not already running.
-                    self.inference_tasks[camera.id] = inference_executor.remote(camera,
-                                                                                num_chunks=self.num_inference_chunks,
-                                                                                retraining_period=self.retraining_period,
-                                                                                test_batch_size=hyperparameters[camera.id]["test_batch_size"],
-                                                                                window_start_time=self.last_retraining_start_time,
-                                                                                logger=self.logger,
-                                                                                camera_idx=camera_idx,
-                                                                                task_id=self.current_task,
-                                                                                )
-            elif this_inference_weight == 0:
+                    self.inference_tasks[camera.id] = inference_executor.remote(
+                        camera,
+                        num_chunks=self.num_inference_chunks,
+                        retraining_period=self.retraining_period,
+                        test_batch_size=hyperparameters[camera.id]["test_batch_size"],
+                        window_start_time=self.last_retraining_start_time,
+                        retrain_fin_tracker=self.retrain_fin_tracker,
+                        logger=self.logger,
+                        camera_idx=camera_idx,
+                        task_id=self.current_task,
+                    )
+            elif this_gpu_fraction == 0:
                 print("[WARN][Task {}] Camera {} was assigned 0 or no resources for inference. Not running inference".format(
                     camera.current_task, camera.id))
         
@@ -249,17 +265,13 @@ class EkyaSubstitution(object):
         pass
 
     def launch_training_jobs(self,
-                             training_resource_weights: dict,
                              hyperparameters: dict,
-                             ray_training_resource_demands: dict):
+                             gpu_training_fractions: dict):
         if self.current_task > 0:
             for camera_idx, camera in enumerate(self.cameras):
-                this_train_weight = training_resource_weights.get(camera.id, 0)
-                camera.training_gpu_weight = this_train_weight
+                this_gpu_fraction = gpu_training_fractions.get(camera.id, 0)
                 # Run retraining only if some resource weight is allocated
-                if this_train_weight > 0:
-                    this_training_ray_demand = ray_training_resource_demands[camera.id]
-                    camera.training_ray_demand = this_training_ray_demand
+                if this_gpu_fraction > 0:
                     # pretrained_model_path = get_pretrained_model_format(camera.dataset_name, self.pretrained_model_dir).format(
                     #                                               hyperparameters[camera.id]["model_name"],
                     #                                               hyperparameters[camera.id]["num_hidden"])
@@ -289,18 +301,24 @@ class EkyaSubstitution(object):
                                 pretrained_model_path = weight_save_path
                         
                         
+                    # window_end_time: absolute timestamp when this window closes
+                    # self.last_retraining_start_time: wall-clock time at the start of this window (set in run())
+                    # self.retraining_period: fixed total window budget in seconds
+                    window_end_time = self.last_retraining_start_time + self.retraining_period
                     (self.retraining_tasks[camera.id],
                      self.retraining_metadata[camera.id]) = camera.run_retraining(hyperparameters[camera.id],
-                                                                         training_resource_weights[camera.id],
-                                                                         this_training_ray_demand,
+                                                                         this_gpu_fraction,
                                                                          dataloaders_dict={},
                                                                          restore_path=pretrained_model_path,
                                                                          profiling_mode=False,
                                                                          task_num=self.current_task,
+                                                                         window_end_time=window_end_time,
                                                                          )
+                    ray.get(self.retrain_fin_tracker.set.remote(camera.id, False))
                     print("[TRAINING START][Task {}] Camera {} training started. hp_id={}, epochs={}, restore_path={}".format(
                         self.current_task, camera.id, hyperparameters[camera.id]["id"], hyperparameters[camera.id]["epochs"], pretrained_model_path))
                 else:
+                    ray.get(self.retrain_fin_tracker.set.remote(camera.id, True))
                     print("[Task {}] Camera {} was assigned 0 or no resources for retraining. Not retraining.".format(camera.current_task, camera.id))
 
     def check_task_loop(self):
@@ -316,6 +334,7 @@ class EkyaSubstitution(object):
 
                 for done_camera_idx, done_camera in enumerate(done_cameras):
                     done_best_val_acc = retraining_results[done_camera_idx][0]
+                    ray.get(self.retrain_fin_tracker.set.remote(done_camera.id, True))
                     print("[TRAINING FIN][Task {}] Camera {} training finished. best_val_acc={:.4f}".format(
                         self.current_task, done_camera.id, done_best_val_acc))
 
@@ -358,13 +377,9 @@ class EkyaSubstitution(object):
                             self.scheduler.reallocation_callback(c.id,
                                                                     self.inference_resource_weights,
                                                                     self.training_resource_weights)
-                        ray_inference_resource_demands, _ = convert_to_ray_demands(self.inference_memory_demand,
-                                                                                    self.inference_resource_weights,
-                                                                                    self.training_memory_demand,
-                                                                                    self.training_resource_weights)
-                        ray_inference_resource_demands = quantize_demands(ray_inference_resource_demands)
+                        gpu_inference_fractions = self.inference_resource_weights
                         # Update the inference model with new retrained weights if inference is running
-                        if c.inference_gpu_weight > 0:
+                        if c.inference_gpu_fraction > 0:
                             # Previous
                             pretrained_model_path = None
 
@@ -404,12 +419,17 @@ class EkyaSubstitution(object):
                         # NOTE(ROMILB): Consider parallelizing this.
                         for x in self.cameras:
                             # Update only if inference was running (wt > 0)
-                            if x.id != c.id and self.inference_resource_weights[x.id] > 0:
+                            if x.id != c.id and gpu_inference_fractions[x.id] > 0:
                                 x.update_inference_model(self.current_hyperparameters[x.id],
-                                                            self.inference_resource_weights[x.id],
-                                                            ray_inference_resource_demands[x.id],
+                                                            gpu_inference_fractions[x.id],
                                                             blocking=False)
                 
+                # Check if all inference tasks have completed
+                done_inference, _ = ray.wait(list(self.inference_tasks.values()), num_returns=len(self.inference_tasks), timeout=0)
+                if len(done_inference) == len(self.inference_tasks):
+                    print("[CHECK TASK LOOP] All inference tasks completed. Breaking early.")
+                    return
+
                 print("Check task loop: remaining time: {}".format(remaining_time))
                 time.sleep(1)   # Sleep before checking again. WARN: This might cause timing leaks.
             if remaining_time <= 0:
@@ -471,21 +491,21 @@ class EkyaSubstitution(object):
         self.retraining_tasks = {}
         self.retraining_metadata = {}
         self.inference_resource_weights, self.training_resource_weights = {}, {}
+        ray.get(self.retrain_fin_tracker.init.remote([c.id for c in self.cameras]))
 
         # Launch inference jobs as the clock starts ticking even before the scheduler is done
-        self.inference_resource_weights, self.current_hyperparameters = self.scheduler.get_inference_schedule(self.cameras, self.num_resources)
-        self.inference_memory_demand, self.training_memory_demand = self.get_memory_demands(self.cameras)
+        self.inference_resource_weights, self.current_hyperparameters = self.scheduler.get_inference_schedule(self.cameras, self.num_resources, task_id=self.current_task)
 
-        # Get ray resource demands to launch inference jobs and quantize for packing
-        ray_inference_resource_demands, _ = convert_to_ray_demands(self.inference_memory_demand, self.inference_memory_demand,
-                                                                                               self.training_memory_demand, self.training_memory_demand)    # HACK: Reduced demand to let micrprofiling run
-        ray_inference_resource_demands = quantize_demands(ray_inference_resource_demands)
-        print("[Ekya] Inference Scheduler allocation: Inference: {}. Ray demands: {}\n".format(self.inference_resource_weights, ray_inference_resource_demands))
-        self.update_inference_jobs(self.inference_resource_weights, self.current_hyperparameters, ray_inference_resource_demands)
+        # Use GPU resource weights directly (no memory-based ray demand conversion)
+        gpu_inference_fractions = self.inference_resource_weights
+        print("[Ekya] Inference Scheduler allocation: Inference: {}. GPU fractions: {}\n".format(self.inference_resource_weights, gpu_inference_fractions))
+        self.update_inference_jobs(self.current_hyperparameters, gpu_inference_fractions)
 
         # Future work: These resource allocations should be over time. Consquently, resource allocations must be updated over time.
         custom_state = {"task_id": self.current_task,
-                        "retraining_period": self.retraining_period}
+                        "retraining_period": self.retraining_period,
+                        "window_start_time": self.last_retraining_start_time,
+                        "retrain_fin_tracker": self.retrain_fin_tracker}
         prev_hyperparams = self.current_hyperparameters
         self.inference_resource_weights, self.training_resource_weights, self.current_hyperparameters = self.scheduler.get_schedule(self.cameras, self.num_resources, custom_state)    # {camera.id: schedule/hyperparameters}
 
@@ -494,17 +514,15 @@ class EkyaSubstitution(object):
             if camera.id not in self.current_hyperparameters:
                 self.current_hyperparameters[camera.id] = prev_hyperparams[camera.id]
 
-        # Get ray resource demands and quantize for packing
-        ray_inference_resource_demands, ray_training_resource_demands = convert_to_ray_demands(self.inference_memory_demand, self.inference_resource_weights,
-                                                                   self.training_memory_demand, self.training_resource_weights)
-        ray_inference_resource_demands = quantize_demands(ray_inference_resource_demands)
-        ray_training_resource_demands = quantize_demands(ray_training_resource_demands)
-        print("[Ekya] Training+Inference Scheduler allocation: Training: {}\nInference: {}\n Ray Training: {}\n Ray Inference: {}".format(self.training_resource_weights, self.inference_resource_weights, ray_training_resource_demands, ray_inference_resource_demands))
+        # Use GPU resource weights directly
+        gpu_inference_fractions = self.inference_resource_weights
+        gpu_training_fractions = self.training_resource_weights
+        print("[Ekya] Training+Inference Scheduler allocation: Training: {}\nInference: {}\n GPU Training: {}\n GPU Inference: {}".format(self.training_resource_weights, self.inference_resource_weights, gpu_training_fractions, gpu_inference_fractions))
         self.log_schedules(self.current_task, self.inference_resource_weights, self.training_resource_weights, self.current_hyperparameters)
 
         # Update inference jobs with new weights from the scheduler and launch retraining jobs
-        self.update_inference_jobs(self.inference_resource_weights, self.current_hyperparameters, ray_inference_resource_demands)
-        self.launch_training_jobs(self.training_resource_weights, self.current_hyperparameters, ray_training_resource_demands)
+        self.update_inference_jobs(self.current_hyperparameters, gpu_inference_fractions)
+        self.launch_training_jobs(self.current_hyperparameters, gpu_training_fractions)
 
     def log_schedules(self, task_id, inference_resource_weights, training_resource_weights, current_hyperparameters):
         self.logger.log_schedules.remote(
@@ -533,16 +551,6 @@ class EkyaSubstitution(object):
                 del camera.inference_model
             # WARN: This will result in RayActorErrors for some of the get tasks - they must be handled in the calling functions.
 
-    def get_memory_demands(self, cameras=None):
-        # Returns memory demands as a fraction of per GPU memory
-        if not cameras:
-            cameras = self.cameras
-        inference_memory_demands = {}
-        training_memory_demands = {}
-        for camera in cameras:
-            inference_memory_demands[camera.id] = camera.inference_memory_footprint()/self.gpu_memory
-            training_memory_demands[camera.id] = camera.training_memory_footprint()/self.gpu_memory
-        return inference_memory_demands, training_memory_demands
 
     
     def shutdown(self, fin_file_path):

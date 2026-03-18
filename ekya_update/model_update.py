@@ -52,6 +52,7 @@ class MLModelSubstitution(object):
                       profiling_mode = False,
                       task_num=None,
                       save_model=True,
+                      window_end_time=None,
                       ):
         """
         Retrains a model given new dataloader.
@@ -85,7 +86,7 @@ class MLModelSubstitution(object):
         retrain_start_time = time.time()
         _, _, best_val_acc, profile, subprofile_test_results, misc_return = self.model.train_model(dataloaders_dict, num_epochs=NUM_EPOCHS, lr=LR,
                                                                                       momentum=MOMENTUM, validation_freq=validation_freq, task_num=task_num, save_model=save_model, label_type=self.label_type,
-                                                                                      subprofile_test_epochs={})
+                                                                                      subprofile_test_epochs={}, window_end_time=window_end_time, train_gpu_fraction=self.gpu_allocation_percentage)
         retrain_end_time = time.time()
         retrain_time = retrain_end_time - retrain_start_time
 
@@ -167,19 +168,20 @@ class EkyaModelWrapper(object):
         self.model = get_default_model_from_params(model_name=model_name, pretrained=True, hidden_layers=hidden_layers, num_out=num_classes, last_layer_only=last_layer_only, weight_path=restore_path, device=self.device)
         
         # Accumulating only the params to update
-        print("Params to learn:")
+        # print("Params to learn:")
         if last_layer_only:
             params_to_update = []
             for name, param in self.model.named_parameters():
                 if param.requires_grad == True:
                     params_to_update.append(param)
-                    print("\t", name)
+                    # print("\t", name)
         else:
             params_to_update = self.model.parameters()
             for name, param in self.model.named_parameters():
                 if param.requires_grad == True:
-                    print("\t", name)
-        
+                    # print("\t", name)
+                    pass
+
         self.params_to_update = params_to_update
     
     def train_model(self, dataloaders, subprofile_test_epochs = None, num_epochs=1, lr=0.001, momentum=0.9,
@@ -187,6 +189,8 @@ class EkyaModelWrapper(object):
                     task_num=None,
                     save_model=True,
                     label_type="ground_truth",
+                    window_end_time=None,
+                    train_gpu_fraction=None,
                     ):
         since = time.time()
         criterion = nn.CrossEntropyLoss()
@@ -233,7 +237,7 @@ class EkyaModelWrapper(object):
                 profile_data = defaultdict(lambda: defaultdict(lambda: 0))
 
                 if epoch != 0 and epoch % validation_freq == validation_freq-1: # Validation is pointless for the first epoch
-                    this_epoch_phases = dataloaders.keys()  # Usually ["train", "val", "test"] but can be only train and val too.
+                    this_epoch_phases = ["train", "val"]
                 else:
                     this_epoch_phases = ["train"]
 
@@ -336,16 +340,24 @@ class EkyaModelWrapper(object):
         
         # Save the best model weights for this tasks training results!
         if save_model:
+            training_fin_time = time.time()
+            idle_time = window_end_time - training_fin_time if window_end_time is not None else None
             weight_save_path = os.path.join(self.log_dir, str(self.camera_idx), f"{task_num}.pt")
             atomic_torch_save(self.model.state_dict(), weight_save_path)
             model_train_history_df_path = os.path.join(self.log_dir, str(self.camera_idx), "model_train_history.csv")
+            num_samples = len(dataloaders['train'].dataset) if dataloaders['train'] is not None else None
             df = pd.DataFrame(
                 {
                     'weight_save_path': [weight_save_path],
                     'task_num': [task_num],
                     'chunk_num': [None],
-                    'hyperparameter_id': [None],
-                    'epoch': [best_epoch],
+                    'best_epoch': [best_epoch],
+                    'num_epochs': [num_epochs],
+                    'lr': [lr],
+                    'momentum': [momentum],
+                    'num_samples': [num_samples],
+                    'idle_time': [idle_time],
+                    'train_gpu_fraction': [train_gpu_fraction],
                 }
             )
             if os.path.exists(model_train_history_df_path):
@@ -569,13 +581,6 @@ class FullyConnectedLayers(nn.Module):
         if feature_extractor_name!=None and input_size==None:
             message = f"This part was designed to get the input size for a fc layer without having to load a model when generating a gating network! As gating networks are currently deprecated, please re-implement the call of gating networks and this part after wards! (This is currently deprecated!!)"
             stop_sys(message, raise_error=True)
-            # if feature_extractor_name == "ViT_Small_Dino_v2":
-            #     input_size=1920
-            # elif feature_extractor_name == "ViT_Small_timm":
-            #     input_size=384
-            # else:
-            #     message=f"Extracting input_size from feature extractor for feature_extractor:{feature_extractor_name} is currently not implemented! exiting sys"
-            #     stop_sys(message, raise_error=True)
             
         elif feature_extractor_name==None and input_size!=None:
             pass # Nothing to be done here, just continue on
@@ -779,7 +784,7 @@ def get_model_from_model_name(model_name, pretrained=True):
             else:
                 message=f"no model {model_name} exists for timm model"
                 stop_sys(message, raise_error=True)
-            model = timm.create_model(model_proxy, pretrained="ImageNet-1K")
+            model = timm.create_model(model_proxy, pretrained=True)
             
         # # Large pretrained models from DINO, No training for these models (Use Registers as well)
         elif 'Dino' in model_name:

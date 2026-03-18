@@ -5,6 +5,16 @@ from datetime import datetime
 DINOv3_MODEL_LOCAL_REPO = "../dinov3"  # Dino v3 git cloned dir
 DINOv3_MODEL_WEIGHT_PATH_BASE = "/mnt/hdd_1/models/official_dino_v3/weights/lvd1689m_vit"  # Dino v3 weights path base dir
 
+def logical_to_physical_gpu(logical_device_idx):
+    """Map logical device index to physical GPU ID using CUDA_VISIBLE_DEVICES."""
+    cuda_val = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_val is not None and cuda_val.strip():
+        gpu_list = list(map(int, cuda_val.split(",")))
+        gpu_string_indexes = str(gpu_list[logical_device_idx])
+    else:
+        gpu_string_indexes = str(logical_device_idx)
+    return gpu_string_indexes
+
 def check_mps_is_running():
     result = subprocess.run(["ps", "-ef"], capture_output=True, text=True)
     mps_is_running =  "nvidia-cuda-mps" in result.stdout

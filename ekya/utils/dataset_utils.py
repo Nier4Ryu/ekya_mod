@@ -7,19 +7,37 @@ from torchvision.datasets import VisionDataset
 
 from ekya.CONFIG_DATASET import CITYSCAPES_PATH
 
+IMAGENET_NORMALIZE_PARAMS = {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}
+GOOGLE_VIT_NORMALIZE_PARAMS = {"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]}
 
-def get_dataset(name: str) -> [VisionDataset, dict]:
+def get_normalize_params_from_model_name(model_name):
+    google_vit_model_names = [
+        "ViT_Tiny_timm",
+        "ViT_Small_timm", "ViT_Small_32_timm",
+        "ViT_Base_timm", "ViT_Base_32_timm",
+        "ViT_Large_timm", "ViT_Large_32_timm",
+    ]
+    if model_name in google_vit_model_names:
+        normalize_params = GOOGLE_VIT_NORMALIZE_PARAMS
+    else:
+        normalize_params = IMAGENET_NORMALIZE_PARAMS
+    return normalize_params
+
+
+def get_dataset(name: str, model_name=None) -> [VisionDataset, dict]:
     '''
     Returns a dataset and the default kwargs to be used with the dataset, if any.
     :param name:
+    :param model_name:
     :return:
     '''
+    normalize_params = get_normalize_params_from_model_name(model_name)
     name = name.lower()
     if name == 'cityscapes':
         from ekya.datasets.CityscapesClassification import CityscapesClassification
         trsf = transforms.Compose([transforms.ToTensor(),
-                                   transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                                        std=[0.229, 0.224, 0.225])])
+                                   transforms.Normalize(mean=normalize_params["mean"],
+                                                        std=normalize_params["std"])])
         dataset_class = CityscapesClassification
         default_args = {"trsf": trsf,
                         "use_cache": True,
@@ -30,8 +48,8 @@ def get_dataset(name: str) -> [VisionDataset, dict]:
         from ekya.datasets.WaymoClassification import WaymoClassification
         trsf = transforms.Compose(
             [transforms.ToTensor(),
-             transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                  std=[0.229, 0.224, 0.225])])
+             transforms.Normalize(mean=normalize_params["mean"],
+                                  std=normalize_params["std"])])
         dataset_class = WaymoClassification
         default_args = {"trsf": trsf,
                         "use_cache": True,
@@ -39,8 +57,8 @@ def get_dataset(name: str) -> [VisionDataset, dict]:
     elif name == 'vegas' or name == 'bellevue':
         from ekya.datasets.Mp4VideoClassification import Mp4VideoClassification
         trsf = transforms.Compose([transforms.ToTensor(),
-                                   transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                                        std=[0.229, 0.224, 0.225])])
+                                   transforms.Normalize(mean=normalize_params["mean"],
+                                                        std=normalize_params["std"])])
         dataset_class = Mp4VideoClassification
         default_args = {"trsf": trsf,
                         "use_cache": True,
