@@ -438,7 +438,9 @@ class SimpleMLPModel(nn.Module):
     def __init__(self, input_size=3*224*224, hidden_layers:Union[int, List[int]]=None, out_size=2, starting_layers:list=None):
         super().__init__()
         
-        if isinstance(hidden_layers, int):
+        if hidden_layers is None:
+            hidden_layers = []
+        elif isinstance(hidden_layers, int):
             hidden_layers = [hidden_layers]
         
         # Set the initial starting_layers
@@ -575,7 +577,9 @@ class FullyConnectedLayers(nn.Module):
     def __init__(self, feature_extractor_name:str=None, input_size:int=None, hidden_layers:Union[int, List[int]]=None, out_size:int=None):
         super().__init__()
         
-        if isinstance(hidden_layers, int):
+        if hidden_layers is None:
+            hidden_layers = []
+        elif isinstance(hidden_layers, int):
             hidden_layers = [hidden_layers]
         
         if feature_extractor_name!=None and input_size==None:
@@ -602,7 +606,9 @@ class FeatureAndOutputModel(nn.Module):
     def __init__(self, model_name, pretrained=True, hidden_layers:Union[int, List[int]]=None, num_out=6, last_layer_only=False, return_val="output"):
         super().__init__()
         
-        if isinstance(hidden_layers, int):
+        if hidden_layers is None:
+            hidden_layers = []
+        elif isinstance(hidden_layers, int):
             hidden_layers = [hidden_layers]
         
         # model

@@ -258,7 +258,8 @@ class CameraSubstitution(object):
             dataloaders_dict = self._get_dataloader(self.current_task,
                                                     train_batch_size=hyperparameters["train_batch_size"],
                                                     subsample_rate=hyperparameters["subsample"],
-                                                    model_name=hyperparameters.get("model_name", None))
+                                                    model_name=hyperparameters["model_name"],
+                                                    last_layer_only=hyperparameters["last_layer_only"])
         
         if profiling_mode:
             message = f"Currently profiling mode is de-activated for camera_update, revert back to ekya or please implement it"
@@ -290,7 +291,8 @@ class CameraSubstitution(object):
                         subsample_rate: float = 1,
                         shuffle: bool = False,
                         save_csv: bool = True,
-                        model_name: str = None):
+                        model_name: str = None,
+                        last_layer_only = None):
 
         # Generate Test dataset for all cases
         dataloaders_dict = {
@@ -337,7 +339,7 @@ class CameraSubstitution(object):
                 atomic_to_csv(train_df, path=train_df_save_path)
                 atomic_to_csv(val_df, path=val_df_save_path)
             
-            dataloaders_dict["train"] = get_train_dataloader_from_df(df=train_df, batch_size=train_batch_size, model_name=model_name, num_workers=num_workers)
+            dataloaders_dict["train"] = get_train_dataloader_from_df(df=train_df, batch_size=train_batch_size, model_name=model_name, num_workers=num_workers, last_layer_only=last_layer_only)
             dataloaders_dict["val"] = get_inference_dataloader_from_df(df=val_df, batch_size=test_batch_size, model_name=model_name, num_workers=num_workers)
 
         return dataloaders_dict
@@ -456,14 +458,14 @@ class CameraSubstitution(object):
         stop_sys(message, raise_error=True)
     
 # Implementations from Lite
-def get_train_dataloader_from_df(df, batch_size, model_name=None, return_vals="img_tensor_and_label_and_golden_label", num_workers=4):
-    mixed_dataset = MixedDatasetPILV2(df, train=True, model_name=model_name, return_vals=return_vals)
+def get_train_dataloader_from_df(df, batch_size, model_name=None, return_vals="img_tensor_and_label_and_golden_label", num_workers=4, last_layer_only=None):
+    mixed_dataset = MixedDatasetPILV2(df, inference_train_related_dict={"train": True, "last_layer_only":last_layer_only}, model_name=model_name, return_vals=return_vals)
     dataloader = DataLoader(mixed_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, prefetch_factor=1, pin_memory=True, persistent_workers=True, multiprocessing_context="spawn") # persistent_workers=True for train function as dataset is static
     return dataloader
 
 def get_inference_dataloader_from_df(df, batch_size, model_name=None, return_vals="img_tensor_and_label_and_golden_label", task_num=None, total_task_num=None, num_workers=4, prefetch_factor=1):
     df = get_df_partition_from_params(df, task_num=task_num, total_task_num=total_task_num)
-    mixed_dataset = MixedDatasetPILV2(df, train=False, model_name=model_name, return_vals=return_vals)
+    mixed_dataset = MixedDatasetPILV2(df, inference_train_related_dict={"train": False}, model_name=model_name, return_vals=return_vals)
     dataloader = DataLoader(mixed_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, prefetch_factor=prefetch_factor, pin_memory=True, multiprocessing_context="spawn")
     return dataloader
 
