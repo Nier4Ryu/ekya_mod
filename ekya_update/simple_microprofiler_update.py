@@ -104,10 +104,20 @@ class SimpleMicroprofilerSubstitution(BaseMicroprofiler):
                            task_num = None,
                            camera_idx:int=None,
                            log_dir:str=None,
+                           model_name: str = None,
                            ) -> dict:
         assert len(dataloaders) == len(candidate_hyperparams)
         results = []
-        resources_per_trial = resources / 4  # Upto "N" parallel ray workers! 
+
+        # Parallelism degree depends on model size:
+        # ResNet-family: up to 4 concurrent workers (smaller GPU footprint)
+        # ViT-family: up to 2 concurrent workers (larger GPU footprint)
+        # if model_name and "ViT" in model_name:
+        #     max_parallel = 2
+        # else:
+        #     max_parallel = 4
+        max_parallel = 2
+        resources_per_trial = resources / max_parallel
 
         if self.device == 'cpu':
             message = "profiling in CPU is impossible in my standard, what is this??"

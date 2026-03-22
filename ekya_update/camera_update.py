@@ -43,6 +43,7 @@ class CameraSubstitution(object):
                 # Dataset Related
                 dataset_name,
                 train_sample_list_path,
+                train_golden_sample_list_path,
                 test_sample_list_path,
                 test_golden_sample_list_path,
 
@@ -86,6 +87,7 @@ class CameraSubstitution(object):
             start_t = time.time()
             self.train_df = pd.read_csv(train_sample_list_path)
             self.train_df["is_dummy"] = False
+            self.train_golden_df = pd.read_csv(train_golden_sample_list_path)
             self.test_df = pd.read_csv(test_sample_list_path)
             self.test_golden_df = pd.read_csv(test_golden_sample_list_path)
             fin_t = time.time()
@@ -172,10 +174,9 @@ class CameraSubstitution(object):
                 print(f"Camera {self.id}: No padding needed "
                       f"(real={self.num_real_test_samples}, total={total_samples_needed})")
 
-            # Add golden_label column to test_df from golden model predictions
+            # Add golden_label column from golden model predictions
             self.test_df["golden_label"] = self.test_golden_df["pred"].values
-            # For train_df, no golden model predictions exist — use ground truth as fallback
-            self.train_df["golden_label"] = self.train_df["label"].values
+            self.train_df["golden_label"] = self.train_golden_df["pred"].values
 
             # Internal params to keep track of where to load...
             self.current_task = -1
@@ -564,29 +565,106 @@ class MixedDataset(Dataset):
         raise NotImplementedError
 
 class MixedDatasetPILV2(MixedDataset):
-    def __init__(self, df, train, model_name=None, return_vals="img_tensor_and_label_and_golden_label"):
+    def __init__(self, df, inference_train_related_dict, model_name=None, return_vals="img_tensor_and_label"):
         super().__init__(df, return_vals=return_vals)
 
         input_size = get_input_size_from_model_name(model_name)
         normalize_params = get_normalize_params_from_model_name(model_name)
+        interpolation = InterpolationMode.BICUBIC if "ViT" in model_name else InterpolationMode.BILINEAR
 
+        train = inference_train_related_dict["train"]
         if train:
-            self.transform = transforms_v2.Compose([
-                transforms_v2.Resize(
-                    input_size,
-                    interpolation=InterpolationMode.BILINEAR,
-                    antialias=True,
-                ),
-                transforms_v2.RandAugment(interpolation=InterpolationMode.BILINEAR),
-                transforms_v2.ToImage(),
-                transforms_v2.ToDtype(torch.float32, scale=True),
-                transforms_v2.Normalize(mean=normalize_params["mean"], std=normalize_params["std"]),
-            ])
+            last_layer_only = inference_train_related_dict["last_layer_only"]
+            if last_layer_only:
+                # self.transform = transforms_v2.Compose([
+                #     transforms_v2.Resize(
+                #         input_size,
+                #         interpolation=interpolation,
+                #         antialias=True,
+                #     ),
+                #     transforms_v2.RandAugment(interpolation=interpolation),
+                #     transforms_v2.ToImage(),
+                #     transforms_v2.ToDtype(torch.float32, scale=True),
+                #     transforms_v2.Normalize(mean=normalize_params["mean"], std=normalize_params["std"]),
+                # ])
+                
+                self.transform = transforms_v2.Compose([
+                    transforms_v2.Resize(
+                        input_size,
+                        interpolation=interpolation,
+                        antialias=True,
+                    ),
+                    transforms_v2.RandomHorizontalFlip(p=0.5),
+                    transforms_v2.ToImage(),
+                    transforms_v2.ToDtype(torch.float32, scale=True),
+                    transforms_v2.Normalize(mean=normalize_params["mean"], std=normalize_params["std"]),
+                ])
+            else:
+                google_vit_model_names = [
+                    "ViT_Tiny_timm",
+                    "ViT_Small_timm", "ViT_Small_32_timm",
+                    "ViT_Base_timm", "ViT_Base_32_timm",
+                    "ViT_Large_timm", "ViT_Large_32_timm",
+                ]
+                if model_name in google_vit_model_names:
+                    # self.transform = transforms_v2.Compose([
+                    #     transforms_v2.Resize(
+                    #         input_size,
+                    #         interpolation=interpolation,
+                    #         antialias=True,
+                    #     ),
+                    #     transforms_v2.RandomHorizontalFlip(p=0.5),
+                    #     # Translation (0.1) allows the 50x50 image to shift slightly without being destroyed
+                    #     transforms_v2.RandomAffine(degrees=10, translate=(0.1, 0.1), interpolation=interpolation),
+                    #     transforms_v2.RandAugment(num_ops=2, magnitude=5), # Lower magnitude (5 vs 9) for small images
+                    #     transforms_v2.ToImage(),
+                    #     transforms_v2.ToDtype(torch.float32, scale=True),
+                    #     transforms_v2.Normalize(mean=normalize_params["mean"], std=normalize_params["std"]),
+                    # ])
+                    
+                    self.transform = transforms_v2.Compose([
+                        transforms_v2.Resize(
+                            input_size,
+                            interpolation=interpolation,
+                            antialias=True,
+                        ),
+                        transforms_v2.RandomHorizontalFlip(),
+                        transforms_v2.RandomCrop(input_size, padding=14),
+                        transforms_v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+                        transforms_v2.ToImage(),
+                        transforms_v2.ToDtype(torch.float32, scale=True),
+                        transforms_v2.Normalize(mean=normalize_params["mean"], std=normalize_params["std"]),
+                    ])
+                else:
+                    # self.transform = transforms_v2.Compose([
+                    #     # Pad by 4 pixels then crop back to 50x50 before resizing to model size
+                    #     transforms_v2.RandomCrop(50, padding=4), 
+                    #     transforms_v2.Resize(input_size, interpolation=InterpolationMode.BILINEAR, antialias=True),
+                    #     transforms_v2.RandomHorizontalFlip(p=0.5),
+                    #     transforms_v2.ColorJitter(brightness=0.1, contrast=0.1), # Safer than RandAugment for tiny images
+                    #     transforms_v2.ToImage(),
+                    #     transforms_v2.ToDtype(torch.float32, scale=True),
+                    #     transforms_v2.Normalize(mean=normalize_params["mean"], std=normalize_params["std"]),
+                    # ])
+                    
+                    self.transform = transforms_v2.Compose([
+                        transforms_v2.Resize(
+                            input_size,
+                            interpolation=interpolation,
+                            antialias=True,
+                        ),
+                        transforms_v2.RandomHorizontalFlip(),
+                        transforms_v2.RandomCrop(input_size, padding=14),
+                        transforms_v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+                        transforms_v2.ToImage(),
+                        transforms_v2.ToDtype(torch.float32, scale=True),
+                        transforms_v2.Normalize(mean=normalize_params["mean"], std=normalize_params["std"]),
+                    ])
         else:
             self.transform = transforms_v2.Compose([
                 transforms_v2.Resize(
                     input_size,
-                    interpolation=InterpolationMode.BILINEAR,
+                    interpolation=interpolation,
                     antialias=True,
                 ),
                 transforms_v2.ToImage(),
@@ -602,3 +680,4 @@ class MixedDatasetPILV2(MixedDataset):
             stop_sys(message=message)
         transformed_img = self.transform(img)
         return transformed_img
+

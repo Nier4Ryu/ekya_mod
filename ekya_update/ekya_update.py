@@ -59,6 +59,7 @@ def inference_executor(camera: CameraSubstitution,
 
     #Iterate over each chunk and run it's inference
     for chunk_id in range(num_chunks):
+        print(f"Inference for camera:{camera.id} {chunk_id}")
         start_time = time.time()
         chunk_idxs = index[chunk_id*chunk_size:(chunk_id+1)*chunk_size]
         chunk_dataset = test_dataset.get_filtered_dataset(chunk_idxs)
@@ -90,6 +91,7 @@ def inference_executor(camera: CameraSubstitution,
                 chunk_id=chunk_id,
                 log_items_path=log_items_path,
             )
+        print(f"Inference for camera:{camera.id} {chunk_id} done + loggign should be done")
 
         end_time = time.time()
         chunk_remaining_time = time_per_chunk - (end_time - start_time)

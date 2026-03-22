@@ -114,6 +114,7 @@ class ThiefSchedulerSubstitution(BaseScheduler):
                 train_batch_size=32,
                 test_batch_size=32,
                 subsample_rate=subsample_rate,
+                model_name=model_name,
             )
             num_frames = len(dataloaders['train'].dataset)
             frame_counts[camera.id] = num_frames
@@ -148,7 +149,8 @@ class ThiefSchedulerSubstitution(BaseScheduler):
             this_microprof = ray_microprof.options(num_cpus=0).remote(self.microprofile_device)
             microprofs[camera.id] = this_microprof
             dataloaders = [camera._get_dataloader(task_id=task_id, train_batch_size=hp["train_batch_size"],
-                                                  test_batch_size=hp["test_batch_size"], subsample_rate=hp["subsample"])
+                                                  test_batch_size=hp["test_batch_size"], subsample_rate=hp["subsample"],
+                                                  model_name=hp["model_name"])
                            for hp in hyp_list]
 
             pretrained_model_path = None
@@ -187,6 +189,7 @@ class ThiefSchedulerSubstitution(BaseScheduler):
                                                                              task_num=task_id,
                                                                              camera_idx=camera_idx,
                                                                              log_dir=self.log_dir,
+                                                                             model_name=hyp_list[0]["model_name"],
                                                                              )
             microprof_tasks[camera.id] = microprof_task
         micrprofile_results = {}
@@ -204,7 +207,8 @@ class ThiefSchedulerSubstitution(BaseScheduler):
         micrprofile_results = {}
         for camera_idx, camera in enumerate(cameras):
             dataloaders = [camera._get_dataloader(task_id=task_id, train_batch_size=hp["train_batch_size"],
-                                                  test_batch_size=hp["test_batch_size"], subsample_rate=hp["subsample"])
+                                                  test_batch_size=hp["test_batch_size"], subsample_rate=hp["subsample"],
+                                                  model_name=hp["model_name"])
                            for hp in hyp_list]
 
             pretrained_model_path = None
@@ -244,6 +248,7 @@ class ThiefSchedulerSubstitution(BaseScheduler):
                 task_num=task_id,
                 camera_idx=camera_idx,
                 log_dir=self.log_dir,
+                model_name=hyp_list[0]["model_name"],
             )
             micrprofile_results[camera.id] = results
             microprofiler.cleanup()
