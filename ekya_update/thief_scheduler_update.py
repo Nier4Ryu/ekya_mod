@@ -10,6 +10,43 @@ from ekya_update.model_update import RayMLModel
 from ekya_update.simple_microprofiler_update import SimpleMicroprofilerSubstitution, subsample_dataloader
 from ekya_update.common import stop_sys, atomic_to_csv, logical_to_physical_gpu
 
+# Labeling time simulation (linear scaling model, same as AdaInf):
+# Reference profiling data (allocation required for 60 fps labeling throughput):
+#   ViT_Large_timm teacher: 42% GPU allocation -> 60 frames/second
+#   resnext101_64x4d teacher: 12% GPU allocation -> 60 frames/second
+LABELING_REFERENCE_FPS = 60
+LABELING_REFERENCE_ALLOCATION_BY_TEACHER = {
+    "ViT_Large_timm": 0.42,
+    "ViT_Large_Dino_v3": 0.42,
+    "resnext101_64x4d": 0.12,
+}
+
+# Model load time (seconds) per teacher model — one-time cost before labeling inference begins
+LABELING_MODEL_LOAD_TIME_BY_TEACHER = {
+    "ViT_Large_timm": 0,
+    "ViT_Large_Dino_v3": 0,
+    "resnext101_64x4d": 0,
+}
+
+
+def get_simulated_labeling_time(teacher_model_name, gpu_allocation_percent, num_samples_to_label):
+    """Simulate labeling time = model_load_time + inference_time.
+    Inference time uses linear scaling from reference profiling data.
+    Only selected samples need labeling (sample selection happens before labeling)."""
+    gpu_allocation_fraction = gpu_allocation_percent / 100
+
+    if teacher_model_name not in LABELING_REFERENCE_ALLOCATION_BY_TEACHER:
+        message = f"No labeling reference data for teacher model: {teacher_model_name}. Known teachers: {list(LABELING_REFERENCE_ALLOCATION_BY_TEACHER.keys())}"
+        stop_sys(message, raise_error=True)
+    else:
+        model_load_time = LABELING_MODEL_LOAD_TIME_BY_TEACHER[teacher_model_name]
+        reference_allocation = LABELING_REFERENCE_ALLOCATION_BY_TEACHER[teacher_model_name]
+        simulated_fps = (gpu_allocation_fraction / reference_allocation) * LABELING_REFERENCE_FPS
+        inference_time = num_samples_to_label / simulated_fps
+        labeling_time = model_load_time + inference_time
+
+    return labeling_time
+
 class ThiefSchedulerSubstitution(BaseScheduler):
     # Updated some part at least
     def __init__(self,
@@ -29,6 +66,7 @@ class ThiefSchedulerSubstitution(BaseScheduler):
         self.predmodel_acc_args = self.scheduler_kwargs["predmodel_acc_args"]
         self.measured_time_per_epoch_for_hyperparams=self.scheduler_kwargs["measured_time_per_epoch_for_hyperparams"]
         self.measured_inittime_for_hyperparams=self.scheduler_kwargs["measured_inittime_for_hyperparams"]
+        self.steal_increment = self.scheduler_kwargs["steal_increment"]
         
         self.model_load_path = model_load_path
         self.log_dir = log_dir
@@ -47,6 +85,7 @@ class ThiefSchedulerSubstitution(BaseScheduler):
                         microprofile_y=np.array([test_acc]),
                         start_acc=default_acc,
                         **self.predmodel_acc_args)
+                    # microprofile_accuracy_model = lambda x: default_acc * np.ones_like(x)
                 except RuntimeError:
                     unsuccesful_models += 1
                     # Simply return the start accuracy
@@ -61,8 +100,7 @@ class ThiefSchedulerSubstitution(BaseScheduler):
 
                 acc_predictions = microprofile_accuracy_model(self.profiling_epochs)
                 runtime_predictions = microprofile_runtime_model(self.profiling_epochs)
-                for acc_prediction, runtime_prediction, epochs in zip(acc_predictions, runtime_predictions,
-                                                                      self.profiling_epochs):
+                for acc_prediction, runtime_prediction, epochs in zip(acc_predictions, runtime_predictions, self.profiling_epochs):
                     hp_temp = hyperparameters.copy()
                     hp_temp['epochs'] = int(epochs)
                     camera_profiles.append([hp_temp, acc_prediction, runtime_prediction, int(epochs), default_acc])
@@ -73,65 +111,40 @@ class ThiefSchedulerSubstitution(BaseScheduler):
                     unsuccesful_models))
         return profiles
     
-    def run_teacher_labeling(self, cameras, task_id, subsample_rates, gpu_resources):
+    def run_teacher_labeling(self, cameras, num_frames_per_camera, gpu_resources):
         """
         Simulate teacher labeling cost without actually spawning a teacher model.
-        Uses model-specific simulated labeling times assuming 50% GPU resources.
+        Uses AdaInf's linear scaling model: labeling_time = num_samples / simulated_fps
+        where simulated_fps = (gpu_allocation / reference_allocation) * 60fps.
 
         :param cameras: list of CameraSubstitution
-        :param task_id: current task id
-        :param subsample_rates: dict {camera.id: subsample_rate} — per-camera labeling rate.
-                                Cameras with 0 or missing rate are skipped.
-        :param gpu_resources: GPU fraction to allocate per teacher actor (unused, kept for interface)
-        :return: (labeling_time, frame_counts) where frame_counts is dict {camera.id: num_frames_labeled}
+        :param num_frames_per_camera: dict {camera.id: num_frames_to_label}.
+                                      Cameras with 0 frames are skipped.
+        :param gpu_resources: GPU fraction (0-1 scale) allocated per teacher
+        :return: labeling_time (wall-clock seconds consumed)
         """
         start_time = time.time()
-        frame_counts = {}
         simulated_budget = 0.0
 
         for camera in cameras:
-            subsample_rate = subsample_rates[camera.id]
-            if subsample_rate <= 0:
-                frame_counts[camera.id] = 0
+            num_frames = num_frames_per_camera[camera.id]
+            if num_frames <= 0:
                 continue
-
-            model_name = camera.model_name_for_golden
-            if model_name == "resnext101_64x4d":
-                base_time = 2.0
-            elif model_name in ("ViT_Large_Dino_v3", "ViT_Large_timm"):
-                base_time = 4.0
-            else:
-                message = f"Error model:{model_name} is currently not supported, add simulation time for it!"
-                stop_sys(message)
-
-            # Add +/-10% uniform noise to make simulation realistic
-            noise = np.random.uniform(-0.1, 0.1) * base_time
-            camera_budget = base_time + noise
-            simulated_budget = max(simulated_budget, camera_budget)
-
-            dataloaders = camera._get_dataloader(
-                task_id=task_id,
-                train_batch_size=32,
-                test_batch_size=32,
-                subsample_rate=subsample_rate,
-                model_name=model_name,
+            simulated_budget += get_simulated_labeling_time(
+                teacher_model_name=camera.model_name_for_golden,
+                gpu_allocation_percent=gpu_resources * 100,
+                num_samples_to_label=num_frames,
             )
-            num_frames = len(dataloaders['train'].dataset)
-            frame_counts[camera.id] = num_frames
 
-        has_work = any(count > 0 for count in frame_counts.values())
-        if has_work:
-            elapsed = time.time() - start_time
-            remaining_sleep = max(0, simulated_budget - elapsed)
-            print(f"[TEACHER LABELING] Simulating {simulated_budget}s labeling time "
-                  f"(sleeping {remaining_sleep:.2f}s after {elapsed:.2f}s setup)")
-            time.sleep(remaining_sleep)
+        if simulated_budget > 0:
+            print(f"[TEACHER LABELING] Simulating {simulated_budget:.2f}s labeling time")
+            time.sleep(simulated_budget)
 
         labeling_time = time.time() - start_time
-        total_frames = sum(frame_counts.values())
+        total_frames = sum(num_frames_per_camera.values())
         print(f"[TEACHER LABELING] Labeling took {labeling_time:.2f}s, "
-              f"total_frames={total_frames}, per_camera={frame_counts}")
-        return labeling_time, frame_counts
+              f"total_frames={total_frames}, per_camera={num_frames_per_camera}")
+        return labeling_time
 
     def execute_microprofiling(self, cameras, task_id, version=2):
         if version == 1:
@@ -150,7 +163,8 @@ class ThiefSchedulerSubstitution(BaseScheduler):
             microprofs[camera.id] = this_microprof
             dataloaders = [camera._get_dataloader(task_id=task_id, train_batch_size=hp["train_batch_size"],
                                                   test_batch_size=hp["test_batch_size"], subsample_rate=hp["subsample"],
-                                                  model_name=hp["model_name"])
+                                                  model_name=hp["model_name"], last_layer_only=hp["last_layer_only"],
+                                                  save_csv_path=os.path.join(self.log_dir, "runtime_logs_micro_profile", f"hp_{hp['id']}"))
                            for hp in hyp_list]
 
             pretrained_model_path = None
@@ -169,9 +183,9 @@ class ThiefSchedulerSubstitution(BaseScheduler):
                     model_train_history_df = pd.read_csv(model_train_history_df_path)
                     weight_save_path = model_train_history_df['weight_save_path'].iloc[-1]
                     prev_task_num = model_train_history_df['task_num'].iloc[-1]
-                    chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
-                    hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
-                    epoch  = model_train_history_df['epoch'].iloc[-1]
+                    # chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
+                    # hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
+                    # epoch  = model_train_history_df['epoch'].iloc[-1]
 
                     # Check for conflict issues
                     if prev_task_num > task_id:
@@ -208,7 +222,8 @@ class ThiefSchedulerSubstitution(BaseScheduler):
         for camera_idx, camera in enumerate(cameras):
             dataloaders = [camera._get_dataloader(task_id=task_id, train_batch_size=hp["train_batch_size"],
                                                   test_batch_size=hp["test_batch_size"], subsample_rate=hp["subsample"],
-                                                  model_name=hp["model_name"])
+                                                  model_name=hp["model_name"], last_layer_only=hp["last_layer_only"],
+                                                  save_csv_path=os.path.join(self.log_dir, "runtime_logs_micro_profile", f"hp_{hp['id']}"))
                            for hp in hyp_list]
 
             pretrained_model_path = None
@@ -227,9 +242,9 @@ class ThiefSchedulerSubstitution(BaseScheduler):
                     model_train_history_df = pd.read_csv(model_train_history_df_path)
                     weight_save_path = model_train_history_df['weight_save_path'].iloc[-1]
                     prev_task_num = model_train_history_df['task_num'].iloc[-1]
-                    chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
-                    hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
-                    epoch  = model_train_history_df['epoch'].iloc[-1]
+                    # chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
+                    # hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
+                    # epoch  = model_train_history_df['epoch'].iloc[-1]
 
                     # Check for conflict issues
                     if prev_task_num > task_id:
@@ -279,15 +294,18 @@ class ThiefSchedulerSubstitution(BaseScheduler):
             labeling_gpu_resources = self.microprofile_resources_per_trial
 
             # ---- Phase 1: Teacher labeling for microprofiling ----
-            # All cameras get the same HP candidates, so label max(hp["subsample"]) * microprofile_subsample_rate
+            # Label enough samples for microprofiling train/val + test evaluation
+            # Train/val: max(hp["subsample"]) * microprofile_subsample_rate * num_samples_per_task
+            # Test eval: microprofile_subsample_rate * num_samples_per_task (same for all HPs)
             max_hp_subsample = max(float(hp["subsample"]) for hp in self.hyperparameters.values())
-            phase1_subsample_rate = max_hp_subsample * self.microprofile_subsample_rate
-            phase1_rates = {c.id: phase1_subsample_rate for c in cameras}
+            phase1_train_val_rate = max_hp_subsample * self.microprofile_subsample_rate
+            phase1_test_rate = self.microprofile_subsample_rate
+            phase1_frame_counts = {c.id: int(c.num_samples_per_task*(phase1_train_val_rate+phase1_test_rate)) for c in cameras}
             print(f"[GET_SCHEDULE] Phase 1: Teacher labeling for microprofiling "
-                  f"(per_camera_subsample={phase1_subsample_rate:.4f})")
-            phase1_labeling_time, phase1_frame_counts = self.run_teacher_labeling(
-                cameras, task_id,
-                subsample_rates=phase1_rates,
+                  f"(train_val_rate={phase1_train_val_rate:.4f}, test_rate={phase1_test_rate:.4f}, frames={phase1_frame_counts})")
+            phase1_labeling_time = self.run_teacher_labeling(
+                cameras,
+                num_frames_per_camera=phase1_frame_counts,
                 gpu_resources=labeling_gpu_resources,
             )
 
@@ -320,7 +338,7 @@ class ThiefSchedulerSubstitution(BaseScheduler):
             SimTrainingCfgs = {}
             for camera in cameras:
                 SimTrainingCfgs[camera.id] = []
-                total_train_frames = len(camera.train_df)
+                total_train_frames = camera.num_samples_per_task
                 phase1_frames_this_camera = phase1_frame_counts[camera.id]
                 for [hp, acc_prediction, runtime_prediction, epochs, preretrain_acc] in profiles[camera.id]:
                     if acc_prediction > preretrain_acc:
@@ -352,32 +370,30 @@ class ThiefSchedulerSubstitution(BaseScheduler):
                                            resources,
                                            remaining_time,
                                            iterations=3,
-                                           steal_increment=0.1)
+                                           steal_increment=self.steal_increment)
             init_schedule = schedule[0]
             print("[THIEF SCHEDULER] Schedule from thief scheduler: {}".format(init_schedule))
             schedule_result = self.extract_ekya_schedule(init_schedule, self.hyperparameters)
 
             # ---- Phase 3: Teacher labeling for retraining (actual) ----
-            _, _, chosen_hyperparameters = schedule_result
-            phase3_rates = {}
+            # Only label for cameras that actually got training resources (weight > 0)
+            inference_resource_weights, training_resource_weights, chosen_hyperparameters = schedule_result
+            phase3_frame_counts = {}
             for camera in cameras:
-                if camera.id in chosen_hyperparameters:
+                if camera.id in chosen_hyperparameters and training_resource_weights.get(camera.id, 0) > 0:
                     chosen_subsample = float(chosen_hyperparameters[camera.id]["subsample"])
-                    total_train_frames = len(camera.train_df)
-                    needed_frames = int(chosen_subsample * total_train_frames)
+                    needed_frames = int(chosen_subsample*camera.num_samples_per_task)
                     already_labeled = phase1_frame_counts[camera.id]
-                    additional_frames = max(0, needed_frames - already_labeled)
-                    # Convert back to a subsample rate for the labeling function
-                    phase3_rates[camera.id] = additional_frames / total_train_frames if total_train_frames > 0 else 0
+                    phase3_frame_counts[camera.id] = max(0, needed_frames-already_labeled)
                 else:
-                    phase3_rates[camera.id] = 0
+                    phase3_frame_counts[camera.id] = 0
 
-            has_phase3_work = any(rate > 0 for rate in phase3_rates.values())
+            has_phase3_work = any(count > 0 for count in phase3_frame_counts.values())
             if has_phase3_work:
-                print(f"[GET_SCHEDULE] Phase 3: Teacher labeling for retraining (rates={phase3_rates})")
-                phase3_labeling_time, phase3_frame_counts = self.run_teacher_labeling(
-                    cameras, task_id,
-                    subsample_rates=phase3_rates,
+                print(f"[GET_SCHEDULE] Phase 3: Teacher labeling for retraining (frames={phase3_frame_counts})")
+                phase3_labeling_time = self.run_teacher_labeling(
+                    cameras,
+                    num_frames_per_camera=phase3_frame_counts,
                     gpu_resources=labeling_gpu_resources,
                 )
             else:
@@ -388,22 +404,90 @@ class ThiefSchedulerSubstitution(BaseScheduler):
             pipeline_finish_time = time.time()
             total_pipeline_time = pipeline_finish_time - pipeline_start_time
             log_path = os.path.join(self.log_dir, "micro_profiling", f"micro_profiling_fin_task_{task_id}.csv")
-            atomic_to_csv(pd.DataFrame([{
+            log_row = {
                 "task_id": task_id,
                 "window_start_time": window_start_time,
                 "labeling_gpu_resources": labeling_gpu_resources,
                 "microprofile_gpu_resources": self.microprofile_resources_per_trial,
                 "phase1_labeling_time": phase1_labeling_time,
-                "phase1_total_frames": total_phase1_frames,
                 "microprofile_time": microprofile_time_taken,
                 "phase3_labeling_time": phase3_labeling_time,
                 "total_pipeline_time": total_pipeline_time,
                 "remaining_for_retraining": retraining_period - total_pipeline_time,
-            }]), path=log_path)
+            }
+            for camera in cameras:
+                log_row[f"phase1_frames_{camera.id}"] = phase1_frame_counts[camera.id]
+                log_row[f"phase3_frames_{camera.id}"] = phase3_frame_counts.get(camera.id, 0)
+            atomic_to_csv(pd.DataFrame([log_row]), path=log_path)
 
             print(f"[GET_SCHEDULE] Pipeline: Phase1={phase1_labeling_time:.1f}s, "
                   f"Microprofile={microprofile_time_taken:.1f}s, Phase3={phase3_labeling_time:.1f}s, "
                   f"Total={total_pipeline_time:.1f}s, Remaining={retraining_period - total_pipeline_time:.1f}s")
+
+            # ---- Log scheduler decisions ----
+            inference_resource_weights, training_resource_weights, chosen_hyperparameters_log = schedule_result
+
+            # Per-camera microprofiling raw results
+            microprofile_rows = []
+            for camera in cameras:
+                for hp_result in microprofile_results[camera.id]:
+                    microprofile_rows.append({
+                        "task_id": task_id,
+                        "camera_id": camera.id,
+                        "hp_id": hp_result["hyperparameters"]["id"],
+                        "preretrain_test_acc": hp_result["preretrain_test_acc"],
+                        "microprofile_test_acc": hp_result["test_acc"],
+                        "time_per_epoch": hp_result["time_per_epoch"],
+                        "init_time": hp_result["init_time"],
+                    })
+            microprofile_log_path = os.path.join(self.log_dir, "scheduler_decisions", f"microprofiling_task_{task_id}.csv")
+            atomic_to_csv(pd.DataFrame(microprofile_rows), path=microprofile_log_path)
+
+            # Per-camera profile predictions (extrapolated accuracy/runtime at each profiling epoch)
+            profile_rows = []
+            for camera in cameras:
+                for [hp, acc_pred, runtime_pred, epochs, preretrain_acc] in profiles[camera.id]:
+                    profile_rows.append({
+                        "task_id": task_id,
+                        "camera_id": camera.id,
+                        "hp_id": hp["id"],
+                        "epochs": epochs,
+                        "predicted_acc": acc_pred,
+                        "predicted_runtime": runtime_pred,
+                        "preretrain_acc": preretrain_acc,
+                        "acc_gain": acc_pred - preretrain_acc,
+                    })
+            profile_log_path = os.path.join(self.log_dir, "scheduler_decisions", f"profiles_task_{task_id}.csv")
+            atomic_to_csv(pd.DataFrame(profile_rows), path=profile_log_path)
+
+            # Final scheduler allocation
+            decision_rows = []
+            for camera in cameras:
+                row = {
+                    "task_id": task_id,
+                    "camera_id": camera.id,
+                    "inference_resource_pct": inference_resource_weights.get(camera.id, 0),
+                    "training_resource_pct": training_resource_weights.get(camera.id, 0),
+                }
+                if camera.id in chosen_hyperparameters_log:
+                    hp = chosen_hyperparameters_log[camera.id]
+                    row["chosen_hp_id"] = hp["id"]
+                    row["chosen_epochs"] = hp["epochs"]
+                    row["chosen_subsample"] = hp["subsample"]
+                    row["chosen_lr"] = hp["learning_rate"]
+                else:
+                    row["chosen_hp_id"] = None
+                    row["chosen_epochs"] = None
+                    row["chosen_subsample"] = None
+                    row["chosen_lr"] = None
+                decision_rows.append(row)
+            decision_log_path = os.path.join(self.log_dir, "scheduler_decisions", f"decisions_task_{task_id}.csv")
+            atomic_to_csv(pd.DataFrame(decision_rows), path=decision_log_path)
+
+            # Raw thief scheduler output
+            raw_schedule_log_path = os.path.join(self.log_dir, "scheduler_decisions", f"raw_schedule_task_{task_id}.csv")
+            raw_rows = [{"task_id": task_id, "job": k, "resource_weight": v} for k, v in init_schedule.items()]
+            atomic_to_csv(pd.DataFrame(raw_rows), path=raw_schedule_log_path)
 
         return schedule_result
     

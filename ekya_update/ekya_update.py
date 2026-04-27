@@ -28,6 +28,8 @@ def inference_executor(camera: CameraSubstitution,
                        retraining_period: int,
                        test_batch_size: int,
                        window_start_time: float,
+                       model_name: str = None,
+                       last_layer_only = None,
                        retrain_fin_tracker: ray.actor.ActorHandle = None,
                        logger: ray.actor.ActorHandle = None,
                        camera_idx=None,
@@ -35,7 +37,7 @@ def inference_executor(camera: CameraSubstitution,
                        ) -> None:
     # WARNING: Camera object is frozen copy at method invocation. Updates to camera wont be reflected in the remote function
     # Parse dataloader and break it into num_chunks
-    test_loader = camera._get_dataloader(camera.current_task, test_batch_size=test_batch_size, save_csv=False)["test"]
+    test_loader = camera._get_dataloader(camera.current_task, test_batch_size=test_batch_size, model_name=model_name, last_layer_only=last_layer_only)["test"]
     test_dataset = test_loader.dataset
     index = test_dataset.get_indexes()
     chunk_size = len(test_dataset)//num_chunks
@@ -229,9 +231,9 @@ class EkyaSubstitution(object):
                         model_train_history_df = pd.read_csv(model_train_history_df_path)
                         weight_save_path = model_train_history_df['weight_save_path'].iloc[-1]
                         prev_task_num = model_train_history_df['task_num'].iloc[-1]
-                        chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
-                        hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
-                        epoch  = model_train_history_df['epoch'].iloc[-1]
+                        # chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
+                        # hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
+                        # epoch  = model_train_history_df['epoch'].iloc[-1]
 
                         # Check for conflict issues
                         print(prev_task_num, self.current_task)
@@ -254,6 +256,8 @@ class EkyaSubstitution(object):
                         retraining_period=self.retraining_period,
                         test_batch_size=hyperparameters[camera.id]["test_batch_size"],
                         window_start_time=self.last_retraining_start_time,
+                        model_name=hyperparameters[camera.id]["model_name"],
+                        last_layer_only=hyperparameters[camera.id]["last_layer_only"],
                         retrain_fin_tracker=self.retrain_fin_tracker,
                         logger=self.logger,
                         camera_idx=camera_idx,
@@ -291,9 +295,9 @@ class EkyaSubstitution(object):
                             model_train_history_df = pd.read_csv(model_train_history_df_path)
                             weight_save_path = model_train_history_df['weight_save_path'].iloc[-1]
                             prev_task_num = model_train_history_df['task_num'].iloc[-1]
-                            chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
-                            hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
-                            epoch  = model_train_history_df['epoch'].iloc[-1]
+                            # chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
+                            # hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
+                            # epoch  = model_train_history_df['epoch'].iloc[-1]
 
                             # Check for conflict issues
                             if prev_task_num > self.current_task:
@@ -353,14 +357,20 @@ class EkyaSubstitution(object):
                         # self.logger.append.remote("retraining_{}".format(camera.id), data)
                         
                         camera_idx = int(camera.id)
+                        time_left_after_retraining = self.retraining_period - retraining_time_taken
+                        actual_training_time = misc_results["total_time"]
+                        per_epoch_avg_time = misc_results["per_epoch_avg_time"]
                         log_items = {
                             "camera_idx":[camera_idx],
                             "task_id":[self.current_task],
                             "retraining_time_taken":[retraining_time_taken],
+                            "time_left_after_retraining":[time_left_after_retraining],
+                            "actual_training_time":[actual_training_time],
+                            "per_epoch_avg_time":[per_epoch_avg_time],
                             "best_val_acc":[best_val_acc],
                             "profile_preretrain_test_acc":[profile_preretrain_test_acc],
-                            "profile_test_acc":[profile_test_acc], 
-                            "hp_id":[hp_id], 
+                            "profile_test_acc":[profile_test_acc],
+                            "hp_id":[hp_id],
                             "hp_epochs":[hp_epochs],
                             "log_time":[log_time],
                         }
@@ -400,9 +410,9 @@ class EkyaSubstitution(object):
                                     model_train_history_df = pd.read_csv(model_train_history_df_path)
                                     weight_save_path = model_train_history_df['weight_save_path'].iloc[-1]
                                     prev_task_num = model_train_history_df['task_num'].iloc[-1]
-                                    chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
-                                    hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
-                                    epoch  = model_train_history_df['epoch'].iloc[-1]
+                                    # chunk_num  = model_train_history_df['chunk_num'].iloc[-1]
+                                    # hyperparameter_id  = model_train_history_df['hyperparameter_id'].iloc[-1]
+                                    # epoch  = model_train_history_df['epoch'].iloc[-1]
 
                                     # Check for conflict issues
                                     if prev_task_num > self.current_task:

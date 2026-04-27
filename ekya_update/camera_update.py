@@ -6,7 +6,7 @@ consider the previous version as deprecated
 As trying to follow the previous version, some names may sound strange
 (ex: test samples comes from train_sample_list / train is called pre-train)
 """
-import pandas as pd, ray, os, torch, time, math
+import numpy as np, pandas as pd, ray, os, torch, time, math
 from lite.src.utils.common import warn_user
 from ray.exceptions import RayActorError
 from PIL import Image
@@ -181,6 +181,11 @@ class CameraSubstitution(object):
             # Internal params to keep track of where to load...
             self.current_task = -1
 
+            # Balanced DB: replay buffer that accumulates exemplars across windows (AdaInf-style)
+            self.db_max_per_class = 500
+            self.db = pd.DataFrame()
+            self.stream_follow_factor = 0.95  # 0.0 = uniform (iCaRL), 1.0 = fully stream-proportional
+
             print("Warning: As realtime inference scaling function is not aquireable without runtime profiling, we use the default ver - labmda x:1")
             self.inference_scaling_function = lambda x: 1
 
@@ -260,7 +265,8 @@ class CameraSubstitution(object):
                                                     train_batch_size=hyperparameters["train_batch_size"],
                                                     subsample_rate=hyperparameters["subsample"],
                                                     model_name=hyperparameters["model_name"],
-                                                    last_layer_only=hyperparameters["last_layer_only"])
+                                                    last_layer_only=hyperparameters["last_layer_only"],
+                                                    save_csv_path=os.path.join(self.log_dir, "runtime_logs"))
         
         if profiling_mode:
             message = f"Currently profiling mode is de-activated for camera_update, revert back to ekya or please implement it"
@@ -291,7 +297,7 @@ class CameraSubstitution(object):
                         num_workers: int = 4,
                         subsample_rate: float = 1,
                         shuffle: bool = False,
-                        save_csv: bool = True,
+                        save_csv_path: str = None,
                         model_name: str = None,
                         last_layer_only = None):
 
@@ -301,49 +307,168 @@ class CameraSubstitution(object):
             "val":None,
             "test":get_inference_dataloader_from_df(df=self.test_df.iloc[self.num_samples_per_task * task_id:self.num_samples_per_task * (task_id + 1)], batch_size=test_batch_size, model_name=model_name),
         }
-        
+
         # Generate Train / Val datasets for task_id>0
         if task_id>0:
             temp_test_df = self.test_df.copy()
+            label_col = "golden_label" if self.label_type == "golden_label" else "label"
 
-            # Generate Train / Val dfs
-            # Sample from Test samples (Use previous window history only)
-            train_and_val_candidate_from_test_indexes = temp_test_df.iloc[self.num_samples_per_task * (task_id - 1):self.num_samples_per_task * task_id]
-            num_samples_to_pick_from_test = max(int(len(train_and_val_candidate_from_test_indexes) * subsample_rate), 2)
-            num_samples_to_pick_from_test_for_train = int(num_samples_to_pick_from_test * self.train_split)
-            train_and_val_from_test_indexes = train_and_val_candidate_from_test_indexes.sample(n=num_samples_to_pick_from_test, random_state=RANDOM_SEED).index
-            train_from_test_indexes = train_and_val_from_test_indexes[:num_samples_to_pick_from_test_for_train]
-            val_from_test_indexes  = train_and_val_from_test_indexes[num_samples_to_pick_from_test_for_train:]
-            train_from_test_df = temp_test_df.loc[train_from_test_indexes]
-            val_from_test_df = temp_test_df.loc[val_from_test_indexes]
-            
-            # Sample from Train/Previous window samples (Window 1:Use pre-train / Window 2~:Use -previous window as it exists!)
-            if task_id == 1:
-                train_and_val_candidate_from_train_indexes = self.train_df
+            # Stream: previous window data
+            stream_df = temp_test_df.iloc[self.num_samples_per_task*(task_id-1):self.num_samples_per_task*task_id]
+
+            if self.db_max_per_class is not None:
+                # --- AdaInf-style: per-label budgeted selection from stream + DB ---
+                # Seed DB with initial training data on first use
+                if len(self.db) == 0:
+                    self._update_db(self.train_df)
+
+                db_df = self.db.copy()
+                num_total_to_pick = max(int(len(stream_df)*subsample_rate), 2)
+
+                # Gather unique labels from stream + DB
+                stream_labels = stream_df[label_col].values
+                unique_labels = np.unique(stream_labels)
+                if len(db_df) > 0:
+                    unique_labels = np.unique(np.concatenate([unique_labels, db_df[label_col].values]))
+
+                # Per-label budgets: blend of uniform + stream-proportional
+                num_labels = len(unique_labels)
+                uniform_budget = max(1, num_total_to_pick // num_labels)
+                total_budget = uniform_budget * num_labels
+                stream_counts = {label: np.sum(stream_labels == label) for label in unique_labels}
+                total_stream = max(1, sum(stream_counts.values()))
+                label_budgets = {}
+                for label in unique_labels:
+                    proportional_share = total_budget * stream_counts.get(label, 0) / total_stream
+                    blended = (1.0-self.stream_follow_factor)*uniform_budget + self.stream_follow_factor*proportional_share
+                    label_budgets[label] = max(1, int(round(blended)))
+
+                # Per-label selection: half stream (random) + half DB (random)
+                selected_stream_dfs = []
+                selected_db_dfs = []
+                for label in unique_labels:
+                    budget = label_budgets[label]
+                    stream_target = budget // 2
+                    db_target = budget - stream_target
+
+                    # Stream candidates for this label
+                    stream_candidates = stream_df[stream_df[label_col] == label]
+                    # DB candidates for this label
+                    db_candidates = db_df[db_df[label_col] == label] if len(db_df) > 0 else pd.DataFrame()
+
+                    # First pass
+                    actual_stream = min(len(stream_candidates), stream_target)
+                    actual_db = min(len(db_candidates), db_target)
+
+                    # Second pass: fill shortfall from the other source
+                    stream_shortfall = stream_target - actual_stream
+                    db_shortfall = db_target - actual_db
+                    actual_db = min(len(db_candidates), db_target+stream_shortfall)
+                    actual_stream = min(len(stream_candidates), stream_target+db_shortfall)
+
+                    # Cap total to budget
+                    if actual_stream+actual_db > budget:
+                        excess = (actual_stream+actual_db) - budget
+                        if actual_stream > stream_target:
+                            trim = min(excess, actual_stream-stream_target)
+                            actual_stream -= trim
+                            excess -= trim
+                        if excess > 0:
+                            actual_db -= excess
+
+                    if actual_stream > 0:
+                        selected_stream_dfs.append(stream_candidates.sample(n=actual_stream, random_state=RANDOM_SEED))
+                    if actual_db > 0:
+                        selected_db_dfs.append(db_candidates.sample(n=actual_db, random_state=RANDOM_SEED))
+
+                parts = selected_stream_dfs + selected_db_dfs
+                if parts:
+                    combined_df = pd.concat(parts, ignore_index=True)
+                else:
+                    combined_df = pd.DataFrame()
+
+                # Update DB with stream data (after selection)
+                self._update_db(stream_df)
+
             else:
-                train_and_val_candidate_from_train_indexes = temp_test_df.iloc[self.num_samples_per_task * (task_id - 2):self.num_samples_per_task * (task_id-1)]
-            num_samples_to_pick_from_train_or_previous_window_ = min(max(int(len(train_and_val_candidate_from_train_indexes) * subsample_rate), 2), num_samples_to_pick_from_test)
-            num_samples_to_pick_from_train_or_previous_window_for_train = int(num_samples_to_pick_from_train_or_previous_window_ * self.train_split)
-            train_and_val_from_train_or_previous_window_indexes = train_and_val_candidate_from_train_indexes.sample(n=num_samples_to_pick_from_train_or_previous_window_, random_state=RANDOM_SEED).index
-            train_from_train_or_previous_window_indexes = train_and_val_from_train_or_previous_window_indexes[:num_samples_to_pick_from_train_or_previous_window_for_train]
-            val_from_train_or_previous_window_indexes = train_and_val_from_train_or_previous_window_indexes[num_samples_to_pick_from_train_or_previous_window_for_train:]
-            train_from_train_or_previous_window_df = train_and_val_candidate_from_train_indexes.loc[train_from_train_or_previous_window_indexes]
-            val_from_train_or_previous_window_df = train_and_val_candidate_from_train_indexes.loc[val_from_train_or_previous_window_indexes]
-            
-            train_df = pd.concat([train_from_test_df, train_from_train_or_previous_window_df])
-            train_df_save_path = os.path.join(self.log_dir, "runtime_logs", "train", f"camera_{self.camera_idx}_task_{task_id}.csv")
-            val_df = pd.concat([val_from_test_df, val_from_train_or_previous_window_df])
-            val_df_save_path = os.path.join(self.log_dir, "runtime_logs", "val", f"camera_{self.camera_idx}_task_{task_id}.csv")
-            
+                # --- Original Ekya behavior: random sample from previous 1-2 windows ---
+                num_samples_to_pick = max(int(len(stream_df)*subsample_rate), 2)
+                stream_sampled = stream_df.sample(n=num_samples_to_pick, random_state=RANDOM_SEED)
+
+                if task_id == 1:
+                    old_candidates = self.train_df
+                else:
+                    old_candidates = temp_test_df.iloc[self.num_samples_per_task*(task_id-2):self.num_samples_per_task*(task_id-1)]
+                num_old = min(max(int(len(old_candidates)*subsample_rate), 2), num_samples_to_pick)
+                old_sampled = old_candidates.sample(n=num_old, random_state=RANDOM_SEED)
+
+                combined_df = pd.concat([stream_sampled, old_sampled], ignore_index=True)
+
+            # Shuffle then split into train / val
+            combined_df = combined_df.sample(frac=1, random_state=RANDOM_SEED).reset_index(drop=True)
+            num_train = int(len(combined_df)*self.train_split)
+            train_df = combined_df.iloc[:num_train]
+            val_df = combined_df.iloc[num_train:]
+
             # Save train / val dfs
-            if save_csv:
-                atomic_to_csv(train_df, path=train_df_save_path)
-                atomic_to_csv(val_df, path=val_df_save_path)
-            
+            if save_csv_path is not None:
+                atomic_to_csv(train_df, path=os.path.join(save_csv_path, "train", f"camera_{self.camera_idx}_task_{task_id}.csv"))
+                atomic_to_csv(val_df, path=os.path.join(save_csv_path, "val", f"camera_{self.camera_idx}_task_{task_id}.csv"))
+
             dataloaders_dict["train"] = get_train_dataloader_from_df(df=train_df, batch_size=train_batch_size, model_name=model_name, num_workers=num_workers, last_layer_only=last_layer_only)
             dataloaders_dict["val"] = get_inference_dataloader_from_df(df=val_df, batch_size=test_batch_size, model_name=model_name, num_workers=num_workers)
 
         return dataloaders_dict
+
+    def _update_db(self, new_data_df):
+        """Ingest new window data into the balanced DB, keeping at most db_max_per_class per class."""
+        label_col = "golden_label" if "golden_label" in new_data_df.columns else "label"
+        non_dummy = new_data_df[new_data_df["is_dummy"] == False] if "is_dummy" in new_data_df.columns else new_data_df
+        self.db = pd.concat([self.db, non_dummy], ignore_index=True)
+        # Trim to db_max_per_class per class (keep most recent samples)
+        self.db = (
+            self.db
+            .groupby(label_col, group_keys=False)
+            .apply(lambda g: g.tail(self.db_max_per_class))
+            .reset_index(drop=True)
+        )
+
+    def _sample_balanced_from_db(self, n_total):
+        """Sample n_total from DB, balanced across classes.
+        Target: N/m per class. If a class has fewer, take all and fill shortfall
+        by random-sampling from non-selected rows across other classes.
+        """
+        if len(self.db) == 0:
+            return pd.DataFrame()
+        label_col = "golden_label" if "golden_label" in self.db.columns else "label"
+        classes = self.db[label_col].unique()
+        m = len(classes)
+        n_per_class = max(n_total // m, 1)
+
+        selected_parts = []
+        shortfall = 0
+        non_selected_parts = []
+        for cls in classes:
+            cls_df = self.db[self.db[label_col] == cls]
+            n_sample = min(n_per_class, len(cls_df))
+            sampled = cls_df.sample(n=n_sample, random_state=RANDOM_SEED)
+            selected_parts.append(sampled)
+            shortfall += (n_per_class - n_sample)
+            # Track non-selected rows from this class for shortfall filling
+            non_selected = cls_df.drop(sampled.index)
+            if len(non_selected) > 0:
+                non_selected_parts.append(non_selected)
+
+        result = pd.concat(selected_parts, ignore_index=True)
+
+        # Fill shortfall by random-sampling from non-selected rows
+        if shortfall > 0 and len(non_selected_parts) > 0:
+            non_selected_pool = pd.concat(non_selected_parts, ignore_index=True)
+            extra = min(shortfall, len(non_selected_pool))
+            if extra > 0:
+                result = pd.concat([result, non_selected_pool.sample(n=extra, random_state=RANDOM_SEED)], ignore_index=True)
+
+        return result
 
     def set_current_task(self, new_current_task: int):
         self.current_task = new_current_task

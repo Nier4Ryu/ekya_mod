@@ -431,7 +431,7 @@ class EkyaModelWrapper(object):
         return float(acc), results
     
     def save(self, path):
-        atomic_torch_save(self.model, path)
+        atomic_torch_save(self.model.state_dict(), path)
         
     def load(self, path):
         self.model.load_state_dict(torch.load(path, map_location=self.device, weights_only=False))
